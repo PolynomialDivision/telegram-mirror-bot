@@ -1,0 +1,38 @@
+[telegram]
+# Obtain api_id and api_hash at https://my.telegram.org/auth → API development tools
+api_id = 12345
+api_hash = "your_api_hash_here"
+
+# Your personal phone number — used for the first-time interactive login
+phone = "+49123456789"
+
+# Public channel username to mirror (without @)
+channel = "YourChannelUsername"
+
+# How many recent messages to send on the very first run (0 = none).
+# On subsequent runs all messages since the last one are always forwarded.
+history_limit = 50
+
+[matrix]
+homeserver = "https://matrix.org"
+user_id = "@yourbot:matrix.org"
+access_token = "syt_YOUR_ACCESS_TOKEN"
+device_id = "YOUR_DEVICE_ID"
+# Optional: security key from Element's "Set up Secure Backup"
+# Needed once to self-sign the bot's device. Remove after first successful run.
+# recovery_key = "EsXX xxxx xxxx xxxx xxxx xxxx xxxx xxxx"
+
+[security]
+# Users allowed to invite the bot to Matrix rooms.
+# If empty, the bot accepts invites from everyone (not recommended).
+allowed_inviters = ["@you:matrix.org"]
+
+# Users allowed to run !reset-trust @user:server to let a user re-verify.
+# If empty (default), nobody can reset trust — the bot only trusts the first verification.
+admin_users = ["@you:matrix.org"]
+
+# Which devices receive room keys:
+#   identity_based  — only cross-signed devices (default, recommended)
+#   only_trusted    — only explicitly verified devices
+#   all_devices     — all devices, no restriction
+encryption_strategy = "identity_based"

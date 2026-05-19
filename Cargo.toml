@@ -1,0 +1,23 @@
+[package]
+name = "telegram-mirror-bot"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "telegram-mirror-bot"
+path = "src/main.rs"
+
+[dependencies]
+matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "7677f090990a0fd3ac0e578da24434d4f80cb4c8" }
+matrix-sdk-base = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "7677f090990a0fd3ac0e578da24434d4f80cb4c8" }
+grammers-client = "0.9"
+grammers-session = "0.9"
+grammers-tl-types = "0.9"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+mime = "0.3"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+futures-util = "0.3"
