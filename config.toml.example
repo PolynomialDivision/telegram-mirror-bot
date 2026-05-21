@@ -23,9 +23,18 @@ device_id = "YOUR_DEVICE_ID"
 # recovery_key = "EsXX xxxx xxxx xxxx xxxx xxxx xxxx xxxx"
 
 [security]
-# Users allowed to invite the bot to Matrix rooms.
-# If empty, the bot accepts invites from everyone (not recommended).
+# Who may invite the bot:
+#   "all"                      — accept invites from any Matrix user
+#   []                         — reject all invites
+#   ["@you:matrix.org"]        — explicit allowlist
 allowed_inviters = ["@you:matrix.org"]
+
+# Rooms the bot may join and mirror into:
+#   "all"                      — operate in any room
+#   []                         — refuse to operate in any room
+#   ["!roomid:matrix.org"]     — explicit allowlist
+# Both allowed_inviters and allowed_rooms must pass before an invite is accepted.
+allowed_rooms = "all"
 
 # Users allowed to run !reset-trust @user:server to let a user re-verify.
 # If empty (default), nobody can reset trust — the bot only trusts the first verification.

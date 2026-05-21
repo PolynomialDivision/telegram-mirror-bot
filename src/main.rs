@@ -89,10 +89,69 @@ impl From<EncryptionStrategy> for CollectStrategy {
     }
 }
 
+// Serde helper: deserializes either the string "all" or a list of strings.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(untagged)]
+enum RawAllowList {
+    Wildcard(String),
+    List(Vec<String>),
+}
+impl Default for RawAllowList {
+    fn default() -> Self {
+        RawAllowList::Wildcard("all".to_owned())
+    }
+}
+
+#[derive(Debug, Clone)]
+enum UserAllowList {
+    All,
+    Deny,
+    Explicit(HashSet<OwnedUserId>),
+}
+impl UserAllowList {
+    fn allows(&self, user: &OwnedUserId) -> bool {
+        match self {
+            Self::All => true,
+            Self::Deny => false,
+            Self::Explicit(set) => set.contains(user),
+        }
+    }
+    fn is_allow_all(&self) -> bool { matches!(self, Self::All) }
+    fn is_deny_all(&self) -> bool { matches!(self, Self::Deny) }
+    fn explicit_count(&self) -> Option<usize> {
+        if let Self::Explicit(set) = self { Some(set.len()) } else { None }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RoomAllowList {
+    All,
+    Deny,
+    Explicit(HashSet<matrix_sdk::ruma::OwnedRoomId>),
+}
+impl RoomAllowList {
+    fn allows(&self, room_id: &matrix_sdk::ruma::RoomId) -> bool {
+        match self {
+            Self::All => true,
+            Self::Deny => false,
+            Self::Explicit(set) => set.contains(room_id),
+        }
+    }
+    fn is_allow_all(&self) -> bool { matches!(self, Self::All) }
+    fn is_deny_all(&self) -> bool { matches!(self, Self::Deny) }
+    fn explicit_count(&self) -> Option<usize> {
+        if let Self::Explicit(set) = self { Some(set.len()) } else { None }
+    }
+}
+
 #[derive(Deserialize, Default)]
 struct SecurityConfig {
+    /// "all" = accept invites from any user; [] = reject all invites; explicit list = allowlist.
     #[serde(default)]
-    allowed_inviters: Vec<String>,
+    allowed_inviters: RawAllowList,
+    /// "all" = operate in any room; [] = operate in no room; explicit list = allowlist.
+    #[serde(default)]
+    allowed_rooms: RawAllowList,
     #[serde(default)]
     admin_users: Vec<String>,
     #[serde(default)]
@@ -104,7 +163,8 @@ struct SecurityConfig {
 #[derive(Clone)]
 struct BotState {
     bot_user_id: OwnedUserId,
-    allowed_inviters: HashSet<OwnedUserId>,
+    allowed_inviters: UserAllowList,
+    allowed_rooms: RoomAllowList,
     admin_users: HashSet<OwnedUserId>,
     reset_allowed: Arc<Mutex<HashSet<OwnedUserId>>>,
 }
@@ -635,17 +695,49 @@ async fn main() -> Result<()> {
     }
     bootstrap_cross_signing(&matrix, &user_id).await;
 
-    let allowed_inviters: HashSet<OwnedUserId> = config
-        .security
-        .allowed_inviters
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
+    let allowed_inviters: UserAllowList = match &config.security.allowed_inviters {
+        RawAllowList::Wildcard(s) if s == "all" => UserAllowList::All,
+        RawAllowList::Wildcard(s) => anyhow::bail!("Invalid allowed_inviters value: {:?} (expected \"all\" or a list)", s),
+        RawAllowList::List(list) if list.is_empty() => UserAllowList::Deny,
+        RawAllowList::List(list) => {
+            let mut set = HashSet::new();
+            for s in list {
+                let uid = s.parse::<OwnedUserId>()
+                    .with_context(|| format!("Invalid Matrix user ID in allowed_inviters: {:?}", s))?;
+                set.insert(uid);
+            }
+            UserAllowList::Explicit(set)
+        }
+    };
 
-    if allowed_inviters.is_empty() {
-        warn!("No allowed_inviters configured — bot accepts invites from anyone");
+    let allowed_rooms: RoomAllowList = match &config.security.allowed_rooms {
+        RawAllowList::Wildcard(s) if s == "all" => RoomAllowList::All,
+        RawAllowList::Wildcard(s) => anyhow::bail!("Invalid allowed_rooms value: {:?} (expected \"all\" or a list)", s),
+        RawAllowList::List(list) if list.is_empty() => RoomAllowList::Deny,
+        RawAllowList::List(list) => {
+            let mut set = HashSet::new();
+            for s in list {
+                let rid = s.parse::<matrix_sdk::ruma::OwnedRoomId>()
+                    .with_context(|| format!("Invalid Matrix room ID in allowed_rooms: {:?}", s))?;
+                set.insert(rid);
+            }
+            RoomAllowList::Explicit(set)
+        }
+    };
+
+    if allowed_inviters.is_deny_all() {
+        warn!("allowed_inviters = [] — bot will reject all invites");
+    } else if allowed_inviters.is_allow_all() {
+        warn!("allowed_inviters = \"all\" — bot will accept invites from any Matrix user");
     } else {
-        info!("Allowed inviters: {allowed_inviters:?}");
+        info!("Allowed inviters configured (explicit list, {} user(s))", allowed_inviters.explicit_count().unwrap_or(0));
+    }
+    if allowed_rooms.is_deny_all() {
+        warn!("allowed_rooms = [] — bot will not operate in any room");
+    } else if allowed_rooms.is_allow_all() {
+        info!("allowed_rooms = \"all\" — bot will operate in any joined room");
+    } else {
+        info!("Allowed rooms configured (explicit list, {} room(s))", allowed_rooms.explicit_count().unwrap_or(0));
     }
 
     let admin_users: HashSet<OwnedUserId> = config
@@ -663,7 +755,8 @@ async fn main() -> Result<()> {
 
     let bot_state = BotState {
         bot_user_id: user_id,
-        allowed_inviters,
+        allowed_inviters: allowed_inviters.clone(),
+        allowed_rooms: allowed_rooms.clone(),
         admin_users,
         reset_allowed: Arc::new(Mutex::new(HashSet::new())),
     };
@@ -677,8 +770,13 @@ async fn main() -> Result<()> {
                 if ev.state_key != state.bot_user_id {
                     return;
                 }
-                if !state.allowed_inviters.is_empty() && !state.allowed_inviters.contains(&ev.sender) {
-                    warn!("Rejecting invite from {} (not in allowed_inviters)", ev.sender);
+                if !state.allowed_inviters.allows(&ev.sender) {
+                    warn!("Rejecting invite from {}: inviter not in allowed_inviters", ev.sender);
+                    room.leave().await.ok();
+                    return;
+                }
+                if !state.allowed_rooms.allows(room.room_id()) {
+                    warn!("Rejecting invite to {}: room not in allowed_rooms", room.room_id());
                     room.leave().await.ok();
                     return;
                 }
@@ -800,9 +898,20 @@ async fn main() -> Result<()> {
     // Drain pending invites from prior sessions.
     let invited = matrix.invited_rooms();
     if !invited.is_empty() {
-        info!("Pending invite(s) found after initial sync — joining {} room(s)", invited.len());
+        info!("Pending invite(s) found after initial sync — processing {} room(s)", invited.len());
         for room in invited {
             let room_id = room.room_id().to_owned();
+            // Inviter info is unavailable when replaying from the store.
+            if allowed_inviters.is_deny_all() {
+                warn!("Pending invite to {room_id} declined: allowed_inviters = []");
+                room.leave().await.ok();
+                continue;
+            }
+            if !allowed_rooms.allows(&room_id) {
+                warn!("Pending invite to {room_id} declined: room not in allowed_rooms");
+                room.leave().await.ok();
+                continue;
+            }
             let via: Vec<OwnedServerName> = room_id
                 .server_name()
                 .map(|s| vec![s.to_owned()])
