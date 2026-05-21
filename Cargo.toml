@@ -8,14 +8,14 @@ name = "telegram-mirror-bot"
 path = "src/main.rs"
 
 [dependencies]
-matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "7677f090990a0fd3ac0e578da24434d4f80cb4c8" }
-matrix-sdk-base = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "7677f090990a0fd3ac0e578da24434d4f80cb4c8" }
+matrix-sdk = { version = "0.17", features = ["sqlite"] }
+matrix-sdk-base = "0.17"
 grammers-client = "0.9"
 grammers-session = "0.9"
 grammers-tl-types = "0.9"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1"
 mime = "0.3"
 anyhow = "1"
 tracing = "0.1"
