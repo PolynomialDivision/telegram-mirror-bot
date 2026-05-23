@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write as IoWrite};
 use std::path::PathBuf;
@@ -950,37 +951,30 @@ async fn main() -> Result<()> {
     info!("Listening for Telegram updates from channel {:?}", config.telegram.channel);
 
     let matrix_for_sync = matrix.clone();
-    let sync_fut = async move {
-        let filter = FilterDefinition::with_lazy_loading();
-        matrix_for_sync.sync(SyncSettings::default().filter(filter.into())).await
-    };
-    tokio::pin!(sync_fut);
+    tokio::spawn(async move {
+        loop {
+            let filter = FilterDefinition::with_lazy_loading();
+            match matrix_for_sync.sync(SyncSettings::default().filter(filter.into())).await {
+                Ok(()) => warn!("Matrix sync exited cleanly — reconnecting"),
+                Err(e) => warn!("Matrix sync error: {e} — reconnecting in 5s"),
+            }
+            sleep(Duration::from_secs(5)).await;
+        }
+    });
 
     loop {
-        tokio::select! {
-            sync_result = &mut sync_fut => {
-                if let Err(e) = sync_result {
-                    error!("Matrix sync ended with error: {e}");
-                }
-                break;
+        let update = update_stream.next().await?;
+        if let Update::NewMessage(msg) = update {
+            if msg.outgoing() {
+                continue;
             }
-            update_result = update_stream.next() => {
-                let update = update_result?;
-                if let Update::NewMessage(msg) = update {
-                    if msg.outgoing() {
-                        continue;
-                    }
-                    if msg.peer_id() != channel_peer_id {
-                        continue;
-                    }
-                    let msg_id = msg.id();
-                    info!("Forwarding live message {msg_id}");
-                    forward_message(&tg, &matrix, &msg).await;
-                    write_last_id(&last_id_path, msg_id).await;
-                }
+            if msg.peer_id() != channel_peer_id {
+                continue;
             }
+            let msg_id = msg.id();
+            info!("Forwarding live message {msg_id}");
+            forward_message(&tg, &matrix, &msg).await;
+            write_last_id(&last_id_path, msg_id).await;
         }
     }
-
-    Ok(())
 }
