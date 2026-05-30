@@ -17,8 +17,16 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 mime = "0.3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 futures-util = "0.3"
 mxbot-common = { git = "https://github.com/PolynomialDivision/mxbot-common" }
+
+[patch.crates-io]
+matrix-sdk        = { path = "../matrix-rust-sdk/crates/matrix-sdk" }
+matrix-sdk-base   = { path = "../matrix-rust-sdk/crates/matrix-sdk-base" }
+matrix-sdk-common = { path = "../matrix-rust-sdk/crates/matrix-sdk-common" }
+matrix-sdk-crypto = { path = "../matrix-rust-sdk/crates/matrix-sdk-crypto" }
+matrix-sdk-sqlite = { path = "../matrix-rust-sdk/crates/matrix-sdk-sqlite" }

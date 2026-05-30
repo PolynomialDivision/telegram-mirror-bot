@@ -12,7 +12,8 @@ use grammers_client::message::Message as TgMessage;
 use grammers_client::tl;
 use grammers_client::update::Update;
 use grammers_client::{Client as TgClient, SenderPool, SignInError};
-use matrix_sdk::attachment::AttachmentConfig;
+use matrix_sdk::attachment::{AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo, BaseVideoInfo};
+use matrix_sdk::ruma::UInt;
 use grammers_session::storages::SqliteSession;
 use grammers_session::types::PeerId;
 use matrix_sdk::{
@@ -402,7 +403,7 @@ async fn send_media_to_rooms(tg: &TgClient, matrix: &MatrixClient, media: &Media
         Media::Photo(_) => ("image/jpeg".to_owned(), "photo.jpg".to_owned()),
         Media::Document(doc) => {
             let m = doc.mime_type().unwrap_or("application/octet-stream").to_owned();
-            let n = doc.name().unwrap_or("file").to_owned();
+            let n = doc.name().filter(|s| !s.is_empty()).unwrap_or("file").to_owned();
             (m, n)
         }
         Media::Sticker(s) => {
@@ -437,19 +438,54 @@ async fn send_media_to_rooms(tg: &TgClient, matrix: &MatrixClient, media: &Media
         return;
     }
 
+    // Extract metadata once before the per-room loop.
+    let size = bytes.len();
+    let is_image = mime.type_() == mime::IMAGE;
+    let is_audio = mime.type_() == mime::AUDIO;
+    let is_video = mime.type_() == mime::VIDEO;
+    let (img_w, img_h) = if is_image { media_dimensions(&bytes) } else { (0, 0) };
+
     let rooms = matrix.joined_rooms();
     if rooms.is_empty() {
         warn!("No joined Matrix rooms — media dropped");
         return;
     }
     for room in rooms {
+        // Rebuild AttachmentInfo per iteration (not Clone) from the primitives above.
+        let uint_size = UInt::new(size as u64);
+        let info = if is_image {
+            AttachmentInfo::Image(BaseImageInfo {
+                width:  if img_w > 0 { UInt::new(img_w as u64) } else { None },
+                height: if img_h > 0 { UInt::new(img_h as u64) } else { None },
+                size:   uint_size,
+                ..Default::default()
+            })
+        } else if is_audio {
+            AttachmentInfo::Audio(BaseAudioInfo { size: uint_size, ..Default::default() })
+        } else if is_video {
+            AttachmentInfo::Video(BaseVideoInfo { size: uint_size, ..Default::default() })
+        } else {
+            AttachmentInfo::File(BaseFileInfo { size: uint_size })
+        };
         if let Err(e) = room
-            .send_attachment(&filename, &mime, bytes.clone(), AttachmentConfig::new())
+            .send_attachment(&filename, &mime, bytes.clone(), AttachmentConfig::new().info(info))
             .await
         {
             error!("Failed to send media to {}: {e}", room.room_id());
         }
     }
+}
+
+/// Extract pixel dimensions from image bytes without full decode.
+/// Supports JPEG, PNG, and WebP (Telegram's three image formats).
+/// Returns (0, 0) on failure — callers treat 0 as "unknown".
+fn media_dimensions(data: &[u8]) -> (u32, u32) {
+    use std::io::Cursor;
+    image::ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .ok()
+        .and_then(|r| r.into_dimensions().ok())
+        .unwrap_or((0, 0))
 }
 
 /// Forward one Telegram message (text and/or media) to all Matrix rooms.

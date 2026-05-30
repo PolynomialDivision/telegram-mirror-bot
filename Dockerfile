@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
+COPY --from=matrix-sdk . /matrix-rust-sdk/
 COPY . .
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
