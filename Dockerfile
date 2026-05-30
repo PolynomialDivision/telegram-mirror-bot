@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 #
-# Cargo.toml patches use path = "../matrix-rust-sdk", so build from the parent:
-#   docker build -f telegram-mirror-bot/Dockerfile -t telegram-mirror-bot ..
+# Build via build-bots.sh which injects the local matrix-rust-sdk as a named
+# build context (--build-context matrix-sdk=...).  Cargo.toml patches resolve
+# path = "../matrix-rust-sdk" against WORKDIR /build → /matrix-rust-sdk.
 #
 # ── Base: chef + build deps ───────────────────────────────────────────────────
 FROM rust:1.95-slim-bookworm AS chef
@@ -13,17 +14,16 @@ WORKDIR /build
 
 # ── Planner ───────────────────────────────────────────────────────────────────
 FROM chef AS planner
-# The [patch.crates-io] entries point to ../matrix-rust-sdk which, with WORKDIR
-# /build, resolves to /matrix-rust-sdk inside the container.
-COPY matrix-rust-sdk/         /matrix-rust-sdk/
-COPY telegram-mirror-bot/     .
+# Inject the SDK from the named build context before analysing deps.
+COPY --from=matrix-sdk . /matrix-rust-sdk/
+COPY . .
 RUN --mount=type=cache,id=shared-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=shared-cargo-registry,target=/usr/local/cargo/registry \
     cargo chef prepare --recipe-path recipe.json
 
 # ── Builder ───────────────────────────────────────────────────────────────────
 FROM chef AS builder
-COPY matrix-rust-sdk/         /matrix-rust-sdk/
+COPY --from=matrix-sdk . /matrix-rust-sdk/
 COPY --from=planner /build/recipe.json recipe.json
 
 RUN --mount=type=cache,id=shared-cargo-git,target=/usr/local/cargo/git \
@@ -31,7 +31,7 @@ RUN --mount=type=cache,id=shared-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=telegram-mirror-bot-target,target=/build/target \
     cargo chef cook --release --recipe-path recipe.json
 
-COPY telegram-mirror-bot/     .
+COPY . .
 RUN --mount=type=cache,id=shared-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=shared-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=telegram-mirror-bot-target,target=/build/target \
