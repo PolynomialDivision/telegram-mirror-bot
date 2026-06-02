@@ -8,8 +8,8 @@ name = "telegram-mirror-bot"
 path = "src/main.rs"
 
 [dependencies]
-matrix-sdk = { version = "0.17", features = ["sqlite"] }
-matrix-sdk-base = "0.17"
+matrix-sdk = { version = "0.18", features = ["sqlite"] }
+matrix-sdk-base = "0.18"
 grammers-client = "0.9"
 grammers-session = "0.9"
 grammers-tl-types = "0.9"
