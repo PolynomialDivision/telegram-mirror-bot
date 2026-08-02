@@ -31,6 +31,9 @@ RUN --mount=type=cache,id=shared-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=telegram-mirror-bot-target,target=/build/target \
     cargo chef cook --release --recipe-path recipe.json
 
+# cargo-chef writes path-dependency skeletons while cooking the recipe. Restore
+# the real SDK workspace before the final locked build.
+COPY --from=matrix-sdk . /matrix-rust-sdk/
 COPY . .
 RUN --mount=type=cache,id=shared-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=shared-cargo-registry,target=/usr/local/cargo/registry \
