@@ -3,7 +3,6 @@ use std::collections::HashSet;
 use std::io::{self, BufRead, Write as IoWrite};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use anyhow::{Context, Result};
 use grammers_client::client::UpdatesConfiguration;
@@ -12,26 +11,26 @@ use grammers_client::message::Message as TgMessage;
 use grammers_client::tl;
 use grammers_client::update::Update;
 use grammers_client::{Client as TgClient, SenderPool, SignInError};
-use matrix_sdk::attachment::{AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo, BaseVideoInfo};
-use matrix_sdk::ruma::UInt;
 use grammers_session::storages::SqliteSession;
 use grammers_session::types::PeerId;
+use matrix_sdk::attachment::{
+    AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo, BaseVideoInfo,
+};
+use matrix_sdk::ruma::UInt;
 use matrix_sdk::{
-    Client as MatrixClient, Room, RoomState,
     config::SyncSettings,
     ruma::{
-        OwnedServerName, OwnedUserId, RoomOrAliasId,
         api::client::filter::FilterDefinition,
-        events::{
-            key::verification::request::ToDeviceKeyVerificationRequestEvent,
-            room::{
-                member::StrippedRoomMemberEvent,
-                message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
-            },
+        events::room::{
+            member::StrippedRoomMemberEvent,
+            message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
         },
+        OwnedServerName, OwnedUserId, RoomOrAliasId,
     },
+    Client as MatrixClient, Room, RoomState,
 };
 use mxbot_common::config::MatrixConfig;
+use mxbot_common::verify::VerificationService;
 use serde::Deserialize;
 use tokio::{fs, time::sleep, time::Duration};
 use tracing::{error, info, warn};
@@ -88,10 +87,18 @@ impl UserAllowList {
             Self::Explicit(set) => set.contains(user),
         }
     }
-    fn is_allow_all(&self) -> bool { matches!(self, Self::All) }
-    fn is_deny_all(&self) -> bool { matches!(self, Self::Deny) }
+    fn is_allow_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
+    fn is_deny_all(&self) -> bool {
+        matches!(self, Self::Deny)
+    }
     fn explicit_count(&self) -> Option<usize> {
-        if let Self::Explicit(set) = self { Some(set.len()) } else { None }
+        if let Self::Explicit(set) = self {
+            Some(set.len())
+        } else {
+            None
+        }
     }
 }
 
@@ -109,10 +116,18 @@ impl RoomAllowList {
             Self::Explicit(set) => set.contains(room_id),
         }
     }
-    fn is_allow_all(&self) -> bool { matches!(self, Self::All) }
-    fn is_deny_all(&self) -> bool { matches!(self, Self::Deny) }
+    fn is_allow_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
+    fn is_deny_all(&self) -> bool {
+        matches!(self, Self::Deny)
+    }
     fn explicit_count(&self) -> Option<usize> {
-        if let Self::Explicit(set) = self { Some(set.len()) } else { None }
+        if let Self::Explicit(set) = self {
+            Some(set.len())
+        } else {
+            None
+        }
     }
 }
 
@@ -128,6 +143,8 @@ struct SecurityConfig {
     admin_users: Vec<String>,
     #[serde(default)]
     encryption_strategy: mxbot_common::config::EncryptionStrategy,
+    #[serde(default)]
+    verification: mxbot_common::config::VerificationConfig,
 }
 
 // ── Bot state ─────────────────────────────────────────────────────────────────
@@ -138,7 +155,7 @@ struct BotState {
     allowed_inviters: UserAllowList,
     allowed_rooms: RoomAllowList,
     admin_users: HashSet<OwnedUserId>,
-    reset_allowed: Arc<Mutex<HashSet<OwnedUserId>>>,
+    verification: VerificationService,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -192,38 +209,94 @@ fn entities_to_html(text: &str, entities: &[tl::enums::MessageEntity]) -> String
         match entity {
             tl::enums::MessageEntity::Bold(e) => {
                 let (o, l) = (e.offset as usize, e.length as usize);
-                events.push(TagEvent { pos: o, is_open: true, tag: "<strong>".into() });
-                events.push(TagEvent { pos: o + l, is_open: false, tag: "</strong>".into() });
+                events.push(TagEvent {
+                    pos: o,
+                    is_open: true,
+                    tag: "<strong>".into(),
+                });
+                events.push(TagEvent {
+                    pos: o + l,
+                    is_open: false,
+                    tag: "</strong>".into(),
+                });
             }
             tl::enums::MessageEntity::Italic(e) => {
                 let (o, l) = (e.offset as usize, e.length as usize);
-                events.push(TagEvent { pos: o, is_open: true, tag: "<em>".into() });
-                events.push(TagEvent { pos: o + l, is_open: false, tag: "</em>".into() });
+                events.push(TagEvent {
+                    pos: o,
+                    is_open: true,
+                    tag: "<em>".into(),
+                });
+                events.push(TagEvent {
+                    pos: o + l,
+                    is_open: false,
+                    tag: "</em>".into(),
+                });
             }
             tl::enums::MessageEntity::Code(e) => {
                 let (o, l) = (e.offset as usize, e.length as usize);
-                events.push(TagEvent { pos: o, is_open: true, tag: "<code>".into() });
-                events.push(TagEvent { pos: o + l, is_open: false, tag: "</code>".into() });
+                events.push(TagEvent {
+                    pos: o,
+                    is_open: true,
+                    tag: "<code>".into(),
+                });
+                events.push(TagEvent {
+                    pos: o + l,
+                    is_open: false,
+                    tag: "</code>".into(),
+                });
             }
             tl::enums::MessageEntity::Pre(e) => {
                 let (o, l) = (e.offset as usize, e.length as usize);
-                events.push(TagEvent { pos: o, is_open: true, tag: "<pre><code>".into() });
-                events.push(TagEvent { pos: o + l, is_open: false, tag: "</code></pre>".into() });
+                events.push(TagEvent {
+                    pos: o,
+                    is_open: true,
+                    tag: "<pre><code>".into(),
+                });
+                events.push(TagEvent {
+                    pos: o + l,
+                    is_open: false,
+                    tag: "</code></pre>".into(),
+                });
             }
             tl::enums::MessageEntity::Strike(e) => {
                 let (o, l) = (e.offset as usize, e.length as usize);
-                events.push(TagEvent { pos: o, is_open: true, tag: "<del>".into() });
-                events.push(TagEvent { pos: o + l, is_open: false, tag: "</del>".into() });
+                events.push(TagEvent {
+                    pos: o,
+                    is_open: true,
+                    tag: "<del>".into(),
+                });
+                events.push(TagEvent {
+                    pos: o + l,
+                    is_open: false,
+                    tag: "</del>".into(),
+                });
             }
             tl::enums::MessageEntity::Underline(e) => {
                 let (o, l) = (e.offset as usize, e.length as usize);
-                events.push(TagEvent { pos: o, is_open: true, tag: "<u>".into() });
-                events.push(TagEvent { pos: o + l, is_open: false, tag: "</u>".into() });
+                events.push(TagEvent {
+                    pos: o,
+                    is_open: true,
+                    tag: "<u>".into(),
+                });
+                events.push(TagEvent {
+                    pos: o + l,
+                    is_open: false,
+                    tag: "</u>".into(),
+                });
             }
             tl::enums::MessageEntity::Spoiler(e) => {
                 let (o, l) = (e.offset as usize, e.length as usize);
-                events.push(TagEvent { pos: o, is_open: true, tag: r#"<span data-mx-spoiler="">"#.into() });
-                events.push(TagEvent { pos: o + l, is_open: false, tag: "</span>".into() });
+                events.push(TagEvent {
+                    pos: o,
+                    is_open: true,
+                    tag: r#"<span data-mx-spoiler="">"#.into(),
+                });
+                events.push(TagEvent {
+                    pos: o + l,
+                    is_open: false,
+                    tag: "</span>".into(),
+                });
             }
             tl::enums::MessageEntity::TextUrl(e) => {
                 let (o, l) = (e.offset as usize, e.length as usize);
@@ -232,7 +305,11 @@ fn entities_to_html(text: &str, entities: &[tl::enums::MessageEntity]) -> String
                     is_open: true,
                     tag: format!("<a href=\"{}\">", html_escape(&e.url)),
                 });
-                events.push(TagEvent { pos: o + l, is_open: false, tag: "</a>".into() });
+                events.push(TagEvent {
+                    pos: o + l,
+                    is_open: false,
+                    tag: "</a>".into(),
+                });
             }
             tl::enums::MessageEntity::Url(e) => {
                 let (o, l) = (e.offset as usize, e.length as usize);
@@ -243,7 +320,11 @@ fn entities_to_html(text: &str, entities: &[tl::enums::MessageEntity]) -> String
                     is_open: true,
                     tag: format!("<a href=\"{}\">", html_escape(&url)),
                 });
-                events.push(TagEvent { pos: o + l, is_open: false, tag: "</a>".into() });
+                events.push(TagEvent {
+                    pos: o + l,
+                    is_open: false,
+                    tag: "</a>".into(),
+                });
             }
             _ => {}
         }
@@ -271,7 +352,11 @@ fn entities_to_html(text: &str, entities: &[tl::enums::MessageEntity]) -> String
             let cp = 0x10000u32 + ((unit as u32 - 0xD800) << 10) + (low as u32 - 0xDC00);
             if let Some(c) = char::from_u32(cp) {
                 let esc = html_escape_char(c);
-                if esc.is_empty() { result.push(c); } else { result.push_str(esc); }
+                if esc.is_empty() {
+                    result.push(c);
+                } else {
+                    result.push_str(esc);
+                }
             }
             i += 2;
         } else {
@@ -280,7 +365,11 @@ fn entities_to_html(text: &str, entities: &[tl::enums::MessageEntity]) -> String
                     result.push_str("<br>");
                 } else {
                     let esc = html_escape_char(c);
-                    if esc.is_empty() { result.push(c); } else { result.push_str(esc); }
+                    if esc.is_empty() {
+                        result.push(c);
+                    } else {
+                        result.push_str(esc);
+                    }
                 }
             }
             i += 1;
@@ -292,7 +381,10 @@ fn entities_to_html(text: &str, entities: &[tl::enums::MessageEntity]) -> String
 
 /// Build (plain_text, html) from a Telegram message.
 /// Returns None if the message has no text content.
-fn format_message(text: &str, entities: Option<&Vec<tl::enums::MessageEntity>>) -> Option<(String, String)> {
+fn format_message(
+    text: &str,
+    entities: Option<&Vec<tl::enums::MessageEntity>>,
+) -> Option<(String, String)> {
     if text.is_empty() {
         return None;
     }
@@ -307,7 +399,8 @@ fn format_message(text: &str, entities: Option<&Vec<tl::enums::MessageEntity>>) 
 // ── Last-ID persistence ───────────────────────────────────────────────────────
 
 async fn read_last_id(path: &std::path::Path) -> i32 {
-    fs::read_to_string(path).await
+    fs::read_to_string(path)
+        .await
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0)
@@ -338,7 +431,9 @@ async fn backfill(
         return Ok(());
     }
 
-    let peer_ref = channel_peer.to_ref().await
+    let peer_ref = channel_peer
+        .to_ref()
+        .await
         .context("Channel peer has no access hash — cannot fetch history")?;
 
     info!(
@@ -402,8 +497,15 @@ async fn send_media_to_rooms(tg: &TgClient, matrix: &MatrixClient, media: &Media
     let (mime_str, filename) = match media {
         Media::Photo(_) => ("image/jpeg".to_owned(), "photo.jpg".to_owned()),
         Media::Document(doc) => {
-            let m = doc.mime_type().unwrap_or("application/octet-stream").to_owned();
-            let n = doc.name().filter(|s| !s.is_empty()).unwrap_or("file").to_owned();
+            let m = doc
+                .mime_type()
+                .unwrap_or("application/octet-stream")
+                .to_owned();
+            let n = doc
+                .name()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("file")
+                .to_owned();
             (m, n)
         }
         Media::Sticker(s) => {
@@ -443,7 +545,11 @@ async fn send_media_to_rooms(tg: &TgClient, matrix: &MatrixClient, media: &Media
     let is_image = mime.type_() == mime::IMAGE;
     let is_audio = mime.type_() == mime::AUDIO;
     let is_video = mime.type_() == mime::VIDEO;
-    let (img_w, img_h) = if is_image { media_dimensions(&bytes) } else { (0, 0) };
+    let (img_w, img_h) = if is_image {
+        media_dimensions(&bytes)
+    } else {
+        (0, 0)
+    };
 
     let rooms = matrix.joined_rooms();
     if rooms.is_empty() {
@@ -455,20 +561,39 @@ async fn send_media_to_rooms(tg: &TgClient, matrix: &MatrixClient, media: &Media
         let uint_size = UInt::new(size as u64);
         let info = if is_image {
             AttachmentInfo::Image(BaseImageInfo {
-                width:  if img_w > 0 { UInt::new(img_w as u64) } else { None },
-                height: if img_h > 0 { UInt::new(img_h as u64) } else { None },
-                size:   uint_size,
+                width: if img_w > 0 {
+                    UInt::new(img_w as u64)
+                } else {
+                    None
+                },
+                height: if img_h > 0 {
+                    UInt::new(img_h as u64)
+                } else {
+                    None
+                },
+                size: uint_size,
                 ..Default::default()
             })
         } else if is_audio {
-            AttachmentInfo::Audio(BaseAudioInfo { size: uint_size, ..Default::default() })
+            AttachmentInfo::Audio(BaseAudioInfo {
+                size: uint_size,
+                ..Default::default()
+            })
         } else if is_video {
-            AttachmentInfo::Video(BaseVideoInfo { size: uint_size, ..Default::default() })
+            AttachmentInfo::Video(BaseVideoInfo {
+                size: uint_size,
+                ..Default::default()
+            })
         } else {
             AttachmentInfo::File(BaseFileInfo { size: uint_size })
         };
         if let Err(e) = room
-            .send_attachment(&filename, &mime, bytes.clone(), AttachmentConfig::new().info(info))
+            .send_attachment(
+                &filename,
+                &mime,
+                bytes.clone(),
+                AttachmentConfig::new().info(info),
+            )
             .await
         {
             error!("Failed to send media to {}: {e}", room.room_id());
@@ -514,14 +639,15 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let config_path = std::env::args().nth(1).unwrap_or_else(|| "config.toml".to_owned());
+    let config_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "config.toml".to_owned());
     let config_str = std::fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config: {config_path}"))?;
     let config: Config = toml::from_str(&config_str)?;
 
-    let store_path = PathBuf::from(
-        std::env::var("STORE_PATH").unwrap_or_else(|_| "store".to_owned()),
-    );
+    let store_path =
+        PathBuf::from(std::env::var("STORE_PATH").unwrap_or_else(|_| "store".to_owned()));
     fs::create_dir_all(&store_path).await?;
 
     // ── Telegram client ───────────────────────────────────────────────────────
@@ -533,8 +659,11 @@ async fn main() -> Result<()> {
             .with_context(|| format!("Failed to open Telegram session at {session_path:?}"))?,
     );
 
-    let SenderPool { runner, updates, handle } =
-        SenderPool::new(Arc::clone(&session), config.telegram.api_id);
+    let SenderPool {
+        runner,
+        updates,
+        handle,
+    } = SenderPool::new(Arc::clone(&session), config.telegram.api_id);
     let tg = TgClient::new(handle.clone());
     tokio::spawn(runner.run());
 
@@ -551,7 +680,9 @@ async fn main() -> Result<()> {
             Err(SignInError::PasswordRequired(hint)) => {
                 let hint_str = hint.hint().unwrap_or("(no hint)");
                 let pw = prompt(&format!("2FA password [{hint_str}]: "));
-                tg.check_password(hint, &pw).await.context("check_password failed")?;
+                tg.check_password(hint, &pw)
+                    .await
+                    .context("check_password failed")?;
                 info!("Signed in with 2FA");
             }
             Err(e) => return Err(e.into()),
@@ -582,17 +713,22 @@ async fn main() -> Result<()> {
         &config.matrix,
         &store_path,
         config.security.encryption_strategy.into(),
-    ).await?;
+    )
+    .await?;
 
     let allowed_inviters: UserAllowList = match &config.security.allowed_inviters {
         RawAllowList::Wildcard(s) if s == "all" => UserAllowList::All,
-        RawAllowList::Wildcard(s) => anyhow::bail!("Invalid allowed_inviters value: {:?} (expected \"all\" or a list)", s),
+        RawAllowList::Wildcard(s) => anyhow::bail!(
+            "Invalid allowed_inviters value: {:?} (expected \"all\" or a list)",
+            s
+        ),
         RawAllowList::List(list) if list.is_empty() => UserAllowList::Deny,
         RawAllowList::List(list) => {
             let mut set = HashSet::new();
             for s in list {
-                let uid = s.parse::<OwnedUserId>()
-                    .with_context(|| format!("Invalid Matrix user ID in allowed_inviters: {:?}", s))?;
+                let uid = s.parse::<OwnedUserId>().with_context(|| {
+                    format!("Invalid Matrix user ID in allowed_inviters: {:?}", s)
+                })?;
                 set.insert(uid);
             }
             UserAllowList::Explicit(set)
@@ -601,12 +737,16 @@ async fn main() -> Result<()> {
 
     let allowed_rooms: RoomAllowList = match &config.security.allowed_rooms {
         RawAllowList::Wildcard(s) if s == "all" => RoomAllowList::All,
-        RawAllowList::Wildcard(s) => anyhow::bail!("Invalid allowed_rooms value: {:?} (expected \"all\" or a list)", s),
+        RawAllowList::Wildcard(s) => anyhow::bail!(
+            "Invalid allowed_rooms value: {:?} (expected \"all\" or a list)",
+            s
+        ),
         RawAllowList::List(list) if list.is_empty() => RoomAllowList::Deny,
         RawAllowList::List(list) => {
             let mut set = HashSet::new();
             for s in list {
-                let rid = s.parse::<matrix_sdk::ruma::OwnedRoomId>()
+                let rid = s
+                    .parse::<matrix_sdk::ruma::OwnedRoomId>()
                     .with_context(|| format!("Invalid Matrix room ID in allowed_rooms: {:?}", s))?;
                 set.insert(rid);
             }
@@ -619,14 +759,20 @@ async fn main() -> Result<()> {
     } else if allowed_inviters.is_allow_all() {
         warn!("allowed_inviters = \"all\" — bot will accept invites from any Matrix user");
     } else {
-        info!("Allowed inviters configured (explicit list, {} user(s))", allowed_inviters.explicit_count().unwrap_or(0));
+        info!(
+            "Allowed inviters configured (explicit list, {} user(s))",
+            allowed_inviters.explicit_count().unwrap_or(0)
+        );
     }
     if allowed_rooms.is_deny_all() {
         warn!("allowed_rooms = [] — bot will not operate in any room");
     } else if allowed_rooms.is_allow_all() {
         info!("allowed_rooms = \"all\" — bot will operate in any joined room");
     } else {
-        info!("Allowed rooms configured (explicit list, {} room(s))", allowed_rooms.explicit_count().unwrap_or(0));
+        info!(
+            "Allowed rooms configured (explicit list, {} room(s))",
+            allowed_rooms.explicit_count().unwrap_or(0)
+        );
     }
 
     let admin_users: HashSet<OwnedUserId> = config
@@ -642,12 +788,23 @@ async fn main() -> Result<()> {
         info!("Admin users: {admin_users:?}");
     }
 
+    let verification_fallback = match &allowed_inviters {
+        UserAllowList::Explicit(users) => users.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        UserAllowList::All | UserAllowList::Deny => Vec::new(),
+    };
+    let verification = VerificationService::allowlisted_tofu_from_config(
+        matrix.clone(),
+        &config.security.verification,
+        &verification_fallback,
+    );
+    verification.install_handlers();
+
     let bot_state = BotState {
         bot_user_id: user_id,
         allowed_inviters: allowed_inviters.clone(),
         allowed_rooms: allowed_rooms.clone(),
         admin_users,
-        reset_allowed: Arc::new(Mutex::new(HashSet::new())),
+        verification,
     };
 
     // Invite handler
@@ -713,70 +870,23 @@ async fn main() -> Result<()> {
         }
     });
 
-    // To-device verification requests
+    // In-room verification requests are handled by mxbot-common.
     matrix.add_event_handler({
         let state = bot_state.clone();
-        move |ev: ToDeviceKeyVerificationRequestEvent, client: MatrixClient| {
-            let state = state.clone();
-            async move {
-                let Some(request) = client
-                    .encryption()
-                    .get_verification_request(&ev.sender, &ev.content.transaction_id)
-                    .await
-                else {
-                    warn!("Verification request object not found");
-                    return;
-                };
-                tokio::spawn(mxbot_common::verify::handle_verification_request(
-                    client,
-                    Arc::clone(&state.reset_allowed),
-                    request,
-                ));
-            }
-        }
-    });
-
-    // In-room verification requests + !reset-trust command
-    matrix.add_event_handler({
-        let state = bot_state.clone();
-        move |ev: OriginalSyncRoomMessageEvent, room: Room, client: MatrixClient| {
+        move |ev: OriginalSyncRoomMessageEvent, room: Room| {
             let state = state.clone();
             async move {
                 if ev.sender == state.bot_user_id || room.state() != RoomState::Joined {
                     return;
                 }
                 match &ev.content.msgtype {
-                    MessageType::VerificationRequest(_) => {
-                        let Some(request) = client
-                            .encryption()
-                            .get_verification_request(&ev.sender, &ev.event_id)
-                            .await
-                        else {
-                            return;
-                        };
-                        tokio::spawn(mxbot_common::verify::handle_verification_request(
-                            client,
-                            Arc::clone(&state.reset_allowed),
-                            request,
-                        ));
-                    }
+                    MessageType::VerificationRequest(_) => {}
                     MessageType::Text(text) => {
                         let body = text.body.trim();
-                        if let Some(rest) = body.strip_prefix("!reset-trust") {
-                            let target = rest.trim();
-                            if state.admin_users.contains(&ev.sender) {
-                                if let Ok(target_user) = target.parse::<OwnedUserId>() {
-                                    state.reset_allowed.lock().await.insert(target_user.clone());
-                                    info!("Trust reset for {target_user} (by {})", ev.sender);
-                                    let msg = RoomMessageEventContent::text_plain(
-                                        format!("Trust reset for {target_user}. They may re-verify."),
-                                    );
-                                    room.send(msg).await.ok();
-                                }
-                            } else {
-                                warn!("!reset-trust from non-admin {}", ev.sender);
-                            }
-                        }
+                        state
+                            .verification
+                            .handle_admin_command(&ev.sender, &state.admin_users, body)
+                            .await;
                     }
                     _ => {}
                 }
@@ -788,14 +898,19 @@ async fn main() -> Result<()> {
     info!("Performing initial Matrix sync...");
     {
         let filter = FilterDefinition::with_lazy_loading();
-        matrix.sync_once(SyncSettings::default().filter(filter.into())).await?;
+        matrix
+            .sync_once(SyncSettings::default().filter(filter.into()))
+            .await?;
     }
     info!("Initial sync complete");
 
     // Drain pending invites from prior sessions.
     let invited = matrix.invited_rooms();
     if !invited.is_empty() {
-        info!("Pending invite(s) found after initial sync — processing {} room(s)", invited.len());
+        info!(
+            "Pending invite(s) found after initial sync — processing {} room(s)",
+            invited.len()
+        );
         for room in invited {
             let room_id = room.room_id().to_owned();
             // Inviter info is unavailable when replaying from the store.
@@ -841,16 +956,28 @@ async fn main() -> Result<()> {
     // ── Run Telegram update loop and Matrix sync concurrently ─────────────────
 
     let mut update_stream = tg
-        .stream_updates(updates, UpdatesConfiguration { catch_up: false, ..Default::default() })
+        .stream_updates(
+            updates,
+            UpdatesConfiguration {
+                catch_up: false,
+                ..Default::default()
+            },
+        )
         .await;
 
-    info!("Listening for Telegram updates from channel {:?}", config.telegram.channel);
+    info!(
+        "Listening for Telegram updates from channel {:?}",
+        config.telegram.channel
+    );
 
     let matrix_for_sync = matrix.clone();
     tokio::spawn(async move {
         loop {
             let filter = FilterDefinition::with_lazy_loading();
-            match matrix_for_sync.sync(SyncSettings::default().filter(filter.into())).await {
+            match matrix_for_sync
+                .sync(SyncSettings::default().filter(filter.into()))
+                .await
+            {
                 Ok(()) => warn!("Matrix sync exited cleanly — reconnecting"),
                 Err(e) => warn!("Matrix sync error: {e} — reconnecting in 5s"),
             }

@@ -45,3 +45,12 @@ admin_users = ["@you:matrix.org"]
 #   only_trusted    — only explicitly verified devices
 #   all_devices     — all devices, no restriction
 encryption_strategy = "identity_based"
+
+[security.verification]
+# Users allowed to complete first-time verification. If omitted or empty,
+# an explicit allowed_inviters list is used as the fallback.
+allowed_users = ["@you:matrix.org"]
+# SAS-only verification limits.
+flow_timeout_secs = 300
+grant_ttl_secs = 600
+max_concurrent = 8
