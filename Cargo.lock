@@ -143,12 +143,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-once-cell"
-version = "0.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4288f83726785267c6f2ef073a3d83dc3f9b81464e9f99898240cced85fce35a"
-
-[[package]]
 name = "async-stream"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2097,7 +2091,6 @@ dependencies = [
  "aquamarine",
  "as_variant",
  "async-channel",
- "async-once-cell",
  "async-stream",
  "async-trait",
  "backon",
@@ -2128,9 +2121,6 @@ dependencies = [
  "pin-project-lite",
  "reqwest",
  "ruma",
- "rustls",
- "rustls-native-certs",
- "rustls-pki-types",
  "serde",
  "serde_html_form",
  "serde_json",
@@ -2144,7 +2134,6 @@ dependencies = [
  "url",
  "urlencoding",
  "vodozemac",
- "webpki-roots",
  "zeroize",
 ]
 
@@ -3276,8 +3265,7 @@ dependencies = [
 [[package]]
 name = "ruma"
 version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee4fe5bfacdb0e95e733da3b6c37d98edf46447a4a8e8dea824e0da266d8ad59"
+source = "git+https://github.com/SchildiChat/ruma?rev=462ac3659#462ac36598b190024d4fe22eda2196d27bf1322e"
 dependencies = [
  "assign",
  "js_int",
@@ -3292,8 +3280,7 @@ dependencies = [
 [[package]]
 name = "ruma-client-api"
 version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf7ca43a888ca569168d7e3901f4dd14a777b860bb19f4c08e35414162eb261c"
+source = "git+https://github.com/SchildiChat/ruma?rev=462ac3659#462ac36598b190024d4fe22eda2196d27bf1322e"
 dependencies = [
  "as_variant",
  "assign",
@@ -3315,8 +3302,7 @@ dependencies = [
 [[package]]
 name = "ruma-common"
 version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c3b4f00112791b490acce57df1ce3eb3f88899b045bebcff8a29f75369640cc"
+source = "git+https://github.com/SchildiChat/ruma?rev=462ac3659#462ac36598b190024d4fe22eda2196d27bf1322e"
 dependencies = [
  "as_variant",
  "base64",
@@ -3349,8 +3335,7 @@ dependencies = [
 [[package]]
 name = "ruma-events"
 version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85d2f90830fc131691349b96a69ff53444eb6c3e8dc7869c77961b43cfaf3344"
+source = "git+https://github.com/SchildiChat/ruma?rev=462ac3659#462ac36598b190024d4fe22eda2196d27bf1322e"
 dependencies = [
  "as_variant",
  "indexmap",
@@ -3370,8 +3355,7 @@ dependencies = [
 [[package]]
 name = "ruma-html"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48d33a944650f4bbd2188dd204d39dd87a9a1498f14b3a13252910c90ed7cd43"
+source = "git+https://github.com/SchildiChat/ruma?rev=462ac3659#462ac36598b190024d4fe22eda2196d27bf1322e"
 dependencies = [
  "as_variant",
  "html5ever",
@@ -3382,8 +3366,7 @@ dependencies = [
 [[package]]
 name = "ruma-identifiers-validation"
 version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d6cff00317675f487c4e7ccfb18875a14c5a14867b51d13f2a826053f03c432"
+source = "git+https://github.com/SchildiChat/ruma?rev=462ac3659#462ac36598b190024d4fe22eda2196d27bf1322e"
 dependencies = [
  "js_int",
  "thiserror 2.0.18",
@@ -3392,8 +3375,7 @@ dependencies = [
 [[package]]
 name = "ruma-macros"
 version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8cfb39eaa9b9fd389126ff941e060b496add5cbbfef559d80c46e571dda459c"
+source = "git+https://github.com/SchildiChat/ruma?rev=462ac3659#462ac36598b190024d4fe22eda2196d27bf1322e"
 dependencies = [
  "as_variant",
  "cfg-if",
@@ -3474,7 +3456,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
  "aws-lc-rs",
- "log",
  "once_cell",
  "rustls-pki-types",
  "rustls-webpki",
@@ -4649,15 +4630,6 @@ name = "webpki-root-certs"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f31141ce3fc3e300ae89b78c0dd67f9708061d1d2eda54b8209346fd6be9a92c"
-dependencies = [
- "rustls-pki-types",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "1.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
 dependencies = [
  "rustls-pki-types",
 ]

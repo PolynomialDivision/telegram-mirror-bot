@@ -67,4 +67,12 @@ COPY --from=builder /telegram-mirror-bot /usr/local/bin/telegram-mirror-bot
 VOLUME /app/store
 VOLUME /app/config
 WORKDIR /app
+
+# The bot touches store/.heartbeat every ~30s from a task independent of Matrix/Telegram
+# traffic, so a stale file means the async runtime itself is wedged (deadlock), not just
+# "no messages recently". A missing binary/crashed process is already caught by Docker's
+# own container-state tracking; this check is for the "running but stuck" case that leaves.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+    CMD sh -c 'f=store/.heartbeat; [ -f "$f" ] && [ $(( $(date +%s) - $(stat -c %Y "$f") )) -lt 90 ]'
+
 CMD ["telegram-mirror-bot", "/app/config/config.toml"]

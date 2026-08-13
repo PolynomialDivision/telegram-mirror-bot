@@ -8,11 +8,13 @@ use anyhow::{Context, Result};
 use grammers_client::client::UpdatesConfiguration;
 use grammers_client::media::Media;
 use grammers_client::message::Message as TgMessage;
+use grammers_client::peer::Peer;
 use grammers_client::tl;
 use grammers_client::update::Update;
-use grammers_client::{Client as TgClient, SenderPool, SignInError};
+use grammers_client::{Client as TgClient, InvocationError, SenderPool, SignInError};
 use grammers_session::storages::SqliteSession;
 use grammers_session::types::PeerId;
+use grammers_session::updates::UpdatesLike;
 use matrix_sdk::attachment::{
     AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo, BaseVideoInfo,
 };
@@ -32,6 +34,7 @@ use matrix_sdk::{
 use mxbot_common::config::MatrixConfig;
 use mxbot_common::verify::VerificationService;
 use serde::Deserialize;
+use tokio::sync::mpsc;
 use tokio::{fs, time::sleep, time::Duration};
 use tracing::{error, info, warn};
 
@@ -174,7 +177,7 @@ fn html_escape_char(c: char) -> &'static str {
         '>' => "&gt;",
         '&' => "&amp;",
         '"' => "&quot;",
-        _ => return "",
+        _ => "",
     }
 }
 
@@ -396,6 +399,121 @@ fn format_message(
     Some((plain, html))
 }
 
+// ── Reliability helpers ──────────────────────────────────────────────────────
+
+/// Bounded exponential backoff with jitter for indefinite retry loops
+/// (Telegram/Matrix reconnects). Never gives up — callers decide when a
+/// failure is permanent and should stop retrying instead.
+struct Backoff {
+    base: Duration,
+    max: Duration,
+    current: Duration,
+}
+
+impl Backoff {
+    fn new(base: Duration, max: Duration) -> Self {
+        Self {
+            base,
+            max,
+            current: base,
+        }
+    }
+
+    /// Resets the delay back to `base`. Call this after a successful
+    /// operation so a later failure doesn't inherit a long-since-stale delay.
+    fn reset(&mut self) {
+        self.current = self.base;
+    }
+
+    /// Returns the delay to wait before the next attempt (base delay plus
+    /// up to ~20% jitter) and doubles the underlying delay, capped at `max`.
+    fn next_delay(&mut self) -> Duration {
+        let max_jitter_ms = ((self.current.as_millis() as u64) / 5).clamp(50, 30_000);
+        let jitter_ms = (jitter_nanos() as u64) % (max_jitter_ms + 1);
+        let delay = self.current + Duration::from_millis(jitter_ms);
+        self.current = (self.current * 2).min(self.max);
+        delay
+    }
+}
+
+/// Cheap, dependency-free source of pseudo-randomness for jitter. Does not
+/// need to be cryptographically strong — it only spreads out retry timing.
+fn jitter_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u128)
+        .unwrap_or(0)
+}
+
+/// Classifies a Telegram [`InvocationError`] as permanent (retrying is
+/// pointless, e.g. the account was logged out or banned) vs transient
+/// (network hiccup, temporary server issue — safe to retry indefinitely).
+fn is_terminal_telegram_error(err: &InvocationError) -> bool {
+    match err {
+        InvocationError::Rpc(rpc) => matches!(
+            rpc.name.as_str(),
+            "AUTH_KEY_UNREGISTERED"
+                | "AUTH_KEY_INVALID"
+                | "AUTH_KEY_PERM_EMPTY"
+                | "SESSION_REVOKED"
+                | "SESSION_EXPIRED"
+                | "USER_DEACTIVATED"
+                | "USER_DEACTIVATED_BAN"
+                | "PHONE_NUMBER_BANNED"
+        ),
+        _ => false,
+    }
+}
+
+/// How often the heartbeat file's timestamp is refreshed. Must stay well
+/// under the `HEALTHCHECK` staleness threshold in the Dockerfile.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Periodically touches a file so an external health check can tell "the
+/// process is alive but the runtime is wedged" apart from "still running
+/// normally". Errors are logged once but never fatal — a broken heartbeat
+/// file should not take the bot down.
+async fn heartbeat_loop(path: PathBuf) {
+    loop {
+        if let Err(e) = fs::write(&path, unix_now_secs().to_string()).await {
+            warn!("Failed to write heartbeat file {path:?}: {e}");
+        }
+        sleep(HEARTBEAT_INTERVAL).await;
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// (Re)builds a Telegram connection: a fresh [`SenderPool`], its client
+/// handle, and the raw update receiver. The pool's driver task is spawned
+/// and supervised here — if it ever exits (e.g. because of a panic deep in
+/// the transport layer), that is logged instead of silently vanishing, and
+/// the closed `updates` channel is what lets [`InvocationError::Dropped`]
+/// surface to callers so they know to reconnect.
+fn spawn_sender_pool(
+    session: &Arc<SqliteSession>,
+    api_id: i32,
+) -> (TgClient, mpsc::UnboundedReceiver<UpdatesLike>) {
+    let SenderPool {
+        runner,
+        updates,
+        handle,
+    } = SenderPool::new(Arc::clone(session), api_id);
+    let tg = TgClient::new(handle);
+    tokio::spawn(async move {
+        runner.run().await;
+        error!(
+            "Telegram connection pool task exited unexpectedly — Telegram updates will reconnect"
+        );
+    });
+    (tg, updates)
+}
+
 // ── Last-ID persistence ───────────────────────────────────────────────────────
 
 async fn read_last_id(path: &std::path::Path) -> i32 {
@@ -478,22 +596,37 @@ async fn backfill(
 
 // ── Matrix helpers ────────────────────────────────────────────────────────────
 
-async fn send_text_to_rooms(matrix: &MatrixClient, plain: &str, html: &str) {
+/// Cap on how much of a single Telegram media item we'll buffer in memory
+/// before giving up on it. Prevents one oversized attachment (or a runaway
+/// stream) from ballooning the process's memory usage; most homeservers
+/// reject uploads well below this anyway.
+const MAX_MEDIA_BYTES: usize = 100 * 1024 * 1024;
+
+async fn send_text_to_rooms(matrix: &MatrixClient, plain: &str, html: &str, tg_msg_id: i32) {
     let rooms = matrix.joined_rooms();
     if rooms.is_empty() {
-        warn!("No joined Matrix rooms — message dropped");
+        warn!(
+            tg_msg_id,
+            "telegram->matrix: no joined Matrix rooms — message dropped"
+        );
         return;
     }
     for room in rooms {
         let content = RoomMessageEventContent::text_html(plain, html);
         if let Err(e) = room.send(content).await {
-            error!("Failed to send to {}: {e}", room.room_id());
+            error!(
+                room_id = %room.room_id(),
+                tg_msg_id,
+                direction = "telegram->matrix",
+                op = "send_text",
+                "Failed to send message: {e}"
+            );
         }
     }
 }
 
 /// Download a Telegram media item and send it to all joined Matrix rooms.
-async fn send_media_to_rooms(tg: &TgClient, matrix: &MatrixClient, media: &Media) {
+async fn send_media_to_rooms(tg: &TgClient, matrix: &MatrixClient, media: &Media, tg_msg_id: i32) {
     let (mime_str, filename) = match media {
         Media::Photo(_) => ("image/jpeg".to_owned(), "photo.jpg".to_owned()),
         Media::Document(doc) => {
@@ -518,20 +651,30 @@ async fn send_media_to_rooms(tg: &TgClient, matrix: &MatrixClient, media: &Media
     let mime: mime::Mime = match mime_str.parse() {
         Ok(m) => m,
         Err(e) => {
-            warn!("Invalid MIME type '{mime_str}': {e}");
+            warn!(tg_msg_id, "Invalid MIME type '{mime_str}': {e}");
             return;
         }
     };
 
-    // Download to memory
+    // Download to memory, bailing out if the item is larger than we're willing to buffer.
     let mut iter = tg.iter_download(media);
     let mut bytes: Vec<u8> = Vec::new();
     loop {
         match iter.next().await {
-            Ok(Some(chunk)) => bytes.extend_from_slice(&chunk),
+            Ok(Some(chunk)) => {
+                if bytes.len() + chunk.len() > MAX_MEDIA_BYTES {
+                    warn!(
+                        tg_msg_id,
+                        limit_bytes = MAX_MEDIA_BYTES,
+                        "Media exceeds size limit — skipping attachment"
+                    );
+                    return;
+                }
+                bytes.extend_from_slice(&chunk);
+            }
             Ok(None) => break,
             Err(e) => {
-                warn!("Failed to download media: {e}");
+                warn!(tg_msg_id, "Failed to download media: {e}");
                 return;
             }
         }
@@ -596,7 +739,13 @@ async fn send_media_to_rooms(tg: &TgClient, matrix: &MatrixClient, media: &Media
             )
             .await
         {
-            error!("Failed to send media to {}: {e}", room.room_id());
+            error!(
+                room_id = %room.room_id(),
+                tg_msg_id,
+                direction = "telegram->matrix",
+                op = "send_media",
+                "Failed to send media: {e}"
+            );
         }
     }
 }
@@ -615,15 +764,16 @@ fn media_dimensions(data: &[u8]) -> (u32, u32) {
 
 /// Forward one Telegram message (text and/or media) to all Matrix rooms.
 async fn forward_message(tg: &TgClient, matrix: &MatrixClient, msg: &TgMessage) {
+    let msg_id = msg.id();
     // Send media first (mirrors Telegram's layout: image above caption)
     if let Some(media) = msg.media() {
-        send_media_to_rooms(tg, matrix, &media).await;
+        send_media_to_rooms(tg, matrix, &media, msg_id).await;
     }
     // Send text / caption
     let text = msg.text();
     if !text.is_empty() {
         if let Some((plain, html)) = format_message(text, msg.fmt_entities()) {
-            send_text_to_rooms(matrix, &plain, &html).await;
+            send_text_to_rooms(matrix, &plain, &html, msg_id).await;
         }
     }
 }
@@ -650,6 +800,12 @@ async fn main() -> Result<()> {
         PathBuf::from(std::env::var("STORE_PATH").unwrap_or_else(|_| "store".to_owned()));
     fs::create_dir_all(&store_path).await?;
 
+    // A liveness heartbeat for `docker healthcheck`: touched on a fixed timer by a task
+    // independent of Matrix/Telegram traffic, so it keeps ticking through quiet periods but
+    // stalls if the async runtime itself wedges (e.g. a deadlock) — the one failure mode that
+    // "the process is still running" can't detect on its own.
+    tokio::spawn(heartbeat_loop(store_path.join(".heartbeat")));
+
     // ── Telegram client ───────────────────────────────────────────────────────
 
     let session_path = store_path.join("telegram.session");
@@ -659,13 +815,7 @@ async fn main() -> Result<()> {
             .with_context(|| format!("Failed to open Telegram session at {session_path:?}"))?,
     );
 
-    let SenderPool {
-        runner,
-        updates,
-        handle,
-    } = SenderPool::new(Arc::clone(&session), config.telegram.api_id);
-    let tg = TgClient::new(handle.clone());
-    tokio::spawn(runner.run());
+    let (tg, updates) = spawn_sender_pool(&session, config.telegram.api_id);
 
     if !tg.is_authorized().await? {
         info!("Not signed in — starting interactive login");
@@ -690,20 +840,6 @@ async fn main() -> Result<()> {
     } else {
         info!("Already signed in");
     }
-
-    // Resolve the configured channel to a PeerId for filtering updates
-    let channel_peer = tg
-        .resolve_username(&config.telegram.channel)
-        .await
-        .context("resolve_username failed")?
-        .with_context(|| format!("Channel '{}' not found", config.telegram.channel))?;
-
-    let channel_peer_id: PeerId = match &channel_peer {
-        grammers_client::peer::Peer::Channel(ch) => ch.id(),
-        grammers_client::peer::Peer::Group(g) => g.id(),
-        grammers_client::peer::Peer::User(u) => u.id(),
-    };
-    info!("Mirroring channel with peer id: {channel_peer_id:?}");
 
     let last_id_path = store_path.join("last_message_id");
 
@@ -895,13 +1031,19 @@ async fn main() -> Result<()> {
     });
 
     // Do an initial sync so the bot knows which rooms it has joined, then spawn continuous sync.
+    // A handful of retries absorbs the kind of transient homeserver hiccup we've seen in
+    // production (503 "Unable to introspect the access token") without failing startup outright.
     info!("Performing initial Matrix sync...");
-    {
-        let filter = FilterDefinition::with_lazy_loading();
-        matrix
-            .sync_once(SyncSettings::default().filter(filter.into()))
-            .await?;
-    }
+    mxbot_common::retry::retry_with_backoff(5, 2, "initial Matrix sync", || {
+        let matrix = matrix.clone();
+        async move {
+            let filter = FilterDefinition::with_lazy_loading();
+            matrix
+                .sync_once(SyncSettings::default().filter(filter.into()))
+                .await
+        }
+    })
+    .await?;
     info!("Initial sync complete");
 
     // Drain pending invites from prior sessions.
@@ -940,64 +1082,324 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ── Backfill history ──────────────────────────────────────────────────────
-
-    let last_id = read_last_id(&last_id_path).await;
-    backfill(
-        &tg,
-        &channel_peer,
-        &matrix,
-        last_id,
-        config.telegram.history_limit,
-        &last_id_path,
-    )
-    .await?;
-
     // ── Run Telegram update loop and Matrix sync concurrently ─────────────────
+    //
+    // Both sides are supervised: a transient failure on either one is retried
+    // with backoff in place, and neither side's failure takes the other down.
+    // The whole process only exits on a genuinely unrecoverable error, or on
+    // SIGTERM/SIGINT for a clean shutdown.
 
-    let mut update_stream = tg
-        .stream_updates(
+    let matrix_sync_handle = tokio::spawn(run_matrix_sync(matrix.clone()));
+
+    tokio::select! {
+        _ = shutdown_signal() => {
+            info!("Received shutdown signal — exiting");
+            Ok(())
+        }
+        res = run_telegram_bridge(
+            session,
+            config.telegram.api_id,
+            config.telegram.channel.clone(),
+            config.telegram.history_limit,
+            tg,
             updates,
-            UpdatesConfiguration {
-                catch_up: false,
-                ..Default::default()
-            },
-        )
-        .await;
-
-    info!(
-        "Listening for Telegram updates from channel {:?}",
-        config.telegram.channel
-    );
-
-    let matrix_for_sync = matrix.clone();
-    tokio::spawn(async move {
-        loop {
-            let filter = FilterDefinition::with_lazy_loading();
-            match matrix_for_sync
-                .sync(SyncSettings::default().filter(filter.into()))
-                .await
-            {
-                Ok(()) => warn!("Matrix sync exited cleanly — reconnecting"),
-                Err(e) => warn!("Matrix sync error: {e} — reconnecting in 5s"),
-            }
-            sleep(Duration::from_secs(5)).await;
+            matrix,
+            last_id_path,
+        ) => {
+            res.context("Telegram bridge task ended")
         }
-    });
+        res = matrix_sync_handle => {
+            match res {
+                Ok(Ok(())) => Err(anyhow::anyhow!("Matrix sync task exited unexpectedly")),
+                Ok(Err(e)) => Err(anyhow::anyhow!("Matrix sync task exited unexpectedly: {e}")),
+                Err(e) => Err(anyhow::anyhow!("Matrix sync task panicked: {e}")),
+            }
+        }
+    }
+}
 
+/// Waits for SIGTERM (Docker's normal stop signal) or SIGINT (Ctrl-C).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                warn!("Failed to install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+}
+
+/// Drives the Matrix `/sync` loop forever, reconnecting with backoff on any
+/// error. Matrix sync failures (as seen in production: transient homeserver
+/// 503s) never take down the Telegram side.
+async fn run_matrix_sync(matrix: MatrixClient) -> Result<()> {
+    let mut backoff = Backoff::new(Duration::from_secs(2), Duration::from_secs(120));
     loop {
-        let update = update_stream.next().await?;
-        if let Update::NewMessage(msg) = update {
-            if msg.outgoing() {
-                continue;
-            }
-            if msg.peer_id() != channel_peer_id {
-                continue;
-            }
-            let msg_id = msg.id();
-            info!("Forwarding live message {msg_id}");
-            forward_message(&tg, &matrix, &msg).await;
-            write_last_id(&last_id_path, msg_id).await;
+        let started = std::time::Instant::now();
+        let filter = FilterDefinition::with_lazy_loading();
+        match matrix
+            .sync(SyncSettings::default().filter(filter.into()))
+            .await
+        {
+            Ok(()) => warn!("Matrix sync exited cleanly — reconnecting"),
+            Err(e) => warn!("Matrix sync error (transient): {e} — reconnecting"),
         }
+        // A sync that stayed up for a while was healthy; don't let one late
+        // hiccup inherit a long backoff built up from earlier failures.
+        if started.elapsed() > Duration::from_secs(60) {
+            backoff.reset();
+        }
+        let delay = backoff.next_delay();
+        info!("Matrix sync reconnecting in {delay:?}");
+        sleep(delay).await;
+    }
+}
+
+/// Drives Telegram update ingestion forever: resolves the target channel,
+/// catches up on anything missed since `last_id`, then forwards live
+/// messages. Reconnects (rebuilding the whole [`SenderPool`]) whenever the
+/// connection is irrecoverably lost (`InvocationError::Dropped`), honors
+/// Telegram's `FLOOD_WAIT` retry_after, and backs off with jitter for other
+/// transient errors. Only returns on a genuinely permanent failure (unknown
+/// channel, revoked/banned session).
+#[allow(clippy::too_many_arguments)]
+async fn run_telegram_bridge(
+    session: Arc<SqliteSession>,
+    api_id: i32,
+    channel: String,
+    history_limit: usize,
+    mut tg: TgClient,
+    mut updates: mpsc::UnboundedReceiver<UpdatesLike>,
+    matrix: MatrixClient,
+    last_id_path: PathBuf,
+) -> Result<()> {
+    let mut backoff = Backoff::new(Duration::from_secs(2), Duration::from_secs(120));
+
+    'reconnect: loop {
+        let channel_peer = loop {
+            match tg.resolve_username(&channel).await {
+                Ok(Some(peer)) => break peer,
+                Ok(None) => {
+                    error!(chat = %channel, "Configured Telegram channel not found — giving up");
+                    return Err(anyhow::anyhow!("Telegram channel '{channel}' not found"));
+                }
+                Err(InvocationError::Dropped) => {
+                    let delay = backoff.next_delay();
+                    warn!(chat = %channel, ?delay, "Telegram connection pool is gone while resolving channel — reconnecting");
+                    sleep(delay).await;
+                    let (new_tg, new_updates) = spawn_sender_pool(&session, api_id);
+                    tg = new_tg;
+                    updates = new_updates;
+                }
+                Err(e) if is_terminal_telegram_error(&e) => {
+                    error!(chat = %channel, "Unrecoverable Telegram error while resolving channel: {e}");
+                    return Err(e.into());
+                }
+                Err(e) => {
+                    let delay = backoff.next_delay();
+                    warn!(chat = %channel, "Failed to resolve Telegram channel: {e} (transient) — retrying in {delay:?}");
+                    sleep(delay).await;
+                }
+            }
+        };
+        let channel_peer_id: PeerId = match &channel_peer {
+            Peer::Channel(ch) => ch.id(),
+            Peer::Group(g) => g.id(),
+            Peer::User(u) => u.id(),
+        };
+        info!(chat = %channel, ?channel_peer_id, "Mirroring Telegram channel");
+        backoff.reset();
+
+        // Catch up on anything sent while we were disconnected (also covers the very first run).
+        // A failure here is not fatal — live updates still start.
+        let last_id = read_last_id(&last_id_path).await;
+        if let Err(e) = backfill(
+            &tg,
+            &channel_peer,
+            &matrix,
+            last_id,
+            history_limit,
+            &last_id_path,
+        )
+        .await
+        {
+            warn!(chat = %channel, "Backfill failed: {e} — continuing with live updates only");
+        }
+
+        let mut update_stream = tg
+            .stream_updates(
+                updates,
+                UpdatesConfiguration {
+                    catch_up: false,
+                    ..Default::default()
+                },
+            )
+            .await;
+        info!(chat = %channel, "Listening for Telegram updates");
+        backoff.reset();
+
+        loop {
+            match update_stream.next().await {
+                Ok(Update::NewMessage(msg)) => {
+                    if msg.outgoing() || msg.peer_id() != channel_peer_id {
+                        continue;
+                    }
+                    let msg_id = msg.id();
+                    info!(
+                        chat = %channel,
+                        tg_msg_id = msg_id,
+                        direction = "telegram->matrix",
+                        "Forwarding message"
+                    );
+                    forward_message(&tg, &matrix, &msg).await;
+                    write_last_id(&last_id_path, msg_id).await;
+                    backoff.reset();
+                }
+                Ok(_) => {}
+                Err(InvocationError::Dropped) => {
+                    let delay = backoff.next_delay();
+                    warn!(chat = %channel, ?delay, "Telegram connection pool is gone — reconnecting");
+                    sleep(delay).await;
+                    let (new_tg, new_updates) = spawn_sender_pool(&session, api_id);
+                    tg = new_tg;
+                    updates = new_updates;
+                    continue 'reconnect;
+                }
+                Err(InvocationError::Rpc(rpc)) if rpc.name == "FLOOD_WAIT" => {
+                    let wait = rpc.value.unwrap_or(5).clamp(1, 3600);
+                    warn!(
+                        chat = %channel,
+                        retry_after_s = wait,
+                        "Telegram rate limit (FLOOD_WAIT) — honoring retry_after"
+                    );
+                    sleep(Duration::from_secs(wait as u64)).await;
+                }
+                Err(e) if is_terminal_telegram_error(&e) => {
+                    error!(chat = %channel, "Unrecoverable Telegram error, giving up: {e}");
+                    return Err(e.into());
+                }
+                Err(e) => {
+                    let delay = backoff.next_delay();
+                    warn!(chat = %channel, "Telegram update stream error (transient): {e} — retrying in {delay:?}");
+                    sleep(delay).await;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_doubles_and_caps() {
+        // next_delay() adds up to ~20% jitter on top of the base delay, so assert ranges
+        // rather than exact values.
+        let mut b = Backoff::new(Duration::from_secs(2), Duration::from_secs(10));
+        let d1 = b.next_delay();
+        assert!(d1 >= Duration::from_secs(2) && d1 <= Duration::from_millis(2_400));
+        let d2 = b.next_delay();
+        assert!(d2 >= Duration::from_secs(4) && d2 <= Duration::from_millis(4_800));
+        let d3 = b.next_delay();
+        assert!(d3 >= Duration::from_secs(8) && d3 <= Duration::from_millis(9_600));
+        // Capped at `max` from here on, regardless of how many more calls happen.
+        for _ in 0..5 {
+            let d = b.next_delay();
+            assert!(d >= Duration::from_secs(10) && d <= Duration::from_secs(12));
+        }
+    }
+
+    #[test]
+    fn backoff_reset_returns_to_base() {
+        let mut b = Backoff::new(Duration::from_secs(2), Duration::from_secs(300));
+        b.next_delay();
+        b.next_delay();
+        b.reset();
+        let d = b.next_delay();
+        assert!(d >= Duration::from_secs(2) && d < Duration::from_secs(3));
+    }
+
+    fn rpc_error(name: &str) -> InvocationError {
+        InvocationError::Rpc(grammers_client::sender::RpcError {
+            code: 400,
+            name: name.to_owned(),
+            value: None,
+            caused_by: None,
+        })
+    }
+
+    #[test]
+    fn terminal_errors_are_classified_as_permanent() {
+        for name in [
+            "AUTH_KEY_UNREGISTERED",
+            "AUTH_KEY_INVALID",
+            "SESSION_REVOKED",
+            "USER_DEACTIVATED",
+            "USER_DEACTIVATED_BAN",
+            "PHONE_NUMBER_BANNED",
+        ] {
+            assert!(
+                is_terminal_telegram_error(&rpc_error(name)),
+                "{name} should be terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_errors_are_not_classified_as_permanent() {
+        for name in ["FLOOD_WAIT", "TIMEOUT", "INTERNAL", "CONNECTION_NOT_INITED"] {
+            assert!(
+                !is_terminal_telegram_error(&rpc_error(name)),
+                "{name} should not be terminal"
+            );
+        }
+        assert!(!is_terminal_telegram_error(&InvocationError::Dropped));
+        assert!(!is_terminal_telegram_error(&InvocationError::InvalidDc));
+    }
+
+    #[test]
+    fn entities_to_html_handles_unicode_and_overlapping_tags() {
+        // "héllo 😀!" with Bold covering the whole ASCII-adjacent word and the emoji,
+        // exercising both the surrogate-pair path and plain escaping.
+        let text = "h\u{e9}llo \u{1F600}!";
+        let entities = vec![tl::enums::MessageEntity::Bold(
+            tl::types::MessageEntityBold {
+                offset: 0,
+                length: "hello ".encode_utf16().count() as i32
+                    + "\u{1F600}".encode_utf16().count() as i32,
+            },
+        )];
+        let html = entities_to_html(text, &entities);
+        assert!(html.starts_with("<strong>"));
+        assert!(html.contains('\u{1F600}'));
+        assert!(html.ends_with("</strong>!"));
+    }
+
+    #[test]
+    fn entities_to_html_escapes_plain_text() {
+        let html = entities_to_html("<script>&\"", &[]);
+        assert_eq!(html, "&lt;script&gt;&amp;&quot;");
+    }
+
+    #[test]
+    fn format_message_returns_none_for_empty_text() {
+        assert!(format_message("", None).is_none());
     }
 }
