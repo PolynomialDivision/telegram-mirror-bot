@@ -5,7 +5,7 @@
 # path = "../matrix-rust-sdk" against WORKDIR /build → /matrix-rust-sdk.
 #
 # ── Base: chef + build deps ───────────────────────────────────────────────────
-FROM rust:1.97.1-slim-bookworm AS chef
+FROM rust:1.98.1-slim-bookworm AS chef
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*
