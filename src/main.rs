@@ -724,14 +724,11 @@ async fn main() -> Result<()> {
 
     let matrix_sync_handle = tokio::spawn({
         let matrix = matrix.clone();
-        async move { matrix.sync_forever().await }
+        async move { mxbot_common::sync::sync_forever_with(&matrix.client, || {}).await }
     });
 
     tokio::select! {
-        _ = shutdown_signal() => {
-            info!("Received shutdown signal — exiting");
-            Ok(())
-        }
+        () = mxbot_common::sync::shutdown_signal() => Ok(()),
         res = run_telegram_bridge(
             session,
             config.telegram.api_id,
@@ -750,33 +747,6 @@ async fn main() -> Result<()> {
                 Err(e) => Err(anyhow::anyhow!("Matrix sync task panicked: {e}")),
             }
         }
-    }
-}
-
-/// Waits for SIGTERM (Docker's normal stop signal) or SIGINT (Ctrl-C).
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        use tokio::signal::unix::{signal, SignalKind};
-        match signal(SignalKind::terminate()) {
-            Ok(mut sig) => {
-                sig.recv().await;
-            }
-            Err(e) => {
-                warn!("Failed to install SIGTERM handler: {e}");
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {}
-        _ = terminate => {}
     }
 }
 

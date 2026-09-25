@@ -1,9 +1,15 @@
-# Credentials
+# Credentials — mounted at runtime, never part of the image
 config.toml
+config.*.toml
+.env
 access
+keys/
 
 # Runtime data
 store/
 
-# Pre-built binary artifacts
+# Build and tooling leftovers
 target/
+.venv/
+.build-logs/
+.git/
