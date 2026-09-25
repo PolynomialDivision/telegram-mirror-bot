@@ -1,5 +1,4 @@
 #![recursion_limit = "256"]
-use std::collections::HashSet;
 use std::io::{self, BufRead, Write as IoWrite};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,24 +14,23 @@ use grammers_client::{Client as TgClient, InvocationError, SenderPool, SignInErr
 use grammers_session::storages::SqliteSession;
 use grammers_session::types::PeerId;
 use grammers_session::updates::UpdatesLike;
-use matrix_sdk::attachment::{
-    AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo, BaseVideoInfo,
-};
-use matrix_sdk::ruma::UInt;
-use matrix_sdk::{
-    config::SyncSettings,
-    ruma::{
-        api::client::filter::FilterDefinition,
-        events::room::{
-            member::StrippedRoomMemberEvent,
-            message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
+use mxbot_common::{
+    config::{MatrixConfig, SecurityConfig},
+    matrix_sdk::{
+        attachment::{
+            AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
+            BaseVideoInfo,
         },
-        OwnedServerName, OwnedUserId, RoomOrAliasId,
+        deserialized_responses::EncryptionInfo,
+        ruma::{
+            events::room::message::{OriginalSyncRoomMessageEvent, RoomMessageEventContent},
+            UInt,
+        },
+        Room, RoomState,
     },
-    Client as MatrixClient, Room, RoomState,
+    retry::Backoff,
+    Bot,
 };
-use mxbot_common::config::MatrixConfig;
-use mxbot_common::verify::VerificationService;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio::{fs, time::sleep, time::Duration};
@@ -61,104 +59,6 @@ struct TelegramConfig {
 
 fn default_history_limit() -> usize {
     50
-}
-
-// Serde helper: deserializes either the string "all" or a list of strings.
-#[derive(Deserialize, Debug, Clone)]
-#[serde(untagged)]
-enum RawAllowList {
-    Wildcard(String),
-    List(Vec<String>),
-}
-impl Default for RawAllowList {
-    fn default() -> Self {
-        RawAllowList::Wildcard("all".to_owned())
-    }
-}
-
-#[derive(Debug, Clone)]
-enum UserAllowList {
-    All,
-    Deny,
-    Explicit(HashSet<OwnedUserId>),
-}
-impl UserAllowList {
-    fn allows(&self, user: &OwnedUserId) -> bool {
-        match self {
-            Self::All => true,
-            Self::Deny => false,
-            Self::Explicit(set) => set.contains(user),
-        }
-    }
-    fn is_allow_all(&self) -> bool {
-        matches!(self, Self::All)
-    }
-    fn is_deny_all(&self) -> bool {
-        matches!(self, Self::Deny)
-    }
-    fn explicit_count(&self) -> Option<usize> {
-        if let Self::Explicit(set) = self {
-            Some(set.len())
-        } else {
-            None
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-enum RoomAllowList {
-    All,
-    Deny,
-    Explicit(HashSet<matrix_sdk::ruma::OwnedRoomId>),
-}
-impl RoomAllowList {
-    fn allows(&self, room_id: &matrix_sdk::ruma::RoomId) -> bool {
-        match self {
-            Self::All => true,
-            Self::Deny => false,
-            Self::Explicit(set) => set.contains(room_id),
-        }
-    }
-    fn is_allow_all(&self) -> bool {
-        matches!(self, Self::All)
-    }
-    fn is_deny_all(&self) -> bool {
-        matches!(self, Self::Deny)
-    }
-    fn explicit_count(&self) -> Option<usize> {
-        if let Self::Explicit(set) = self {
-            Some(set.len())
-        } else {
-            None
-        }
-    }
-}
-
-#[derive(Deserialize, Default)]
-struct SecurityConfig {
-    /// "all" = accept invites from any user; [] = reject all invites; explicit list = allowlist.
-    #[serde(default)]
-    allowed_inviters: RawAllowList,
-    /// "all" = operate in any room; [] = operate in no room; explicit list = allowlist.
-    #[serde(default)]
-    allowed_rooms: RawAllowList,
-    #[serde(default)]
-    admin_users: Vec<String>,
-    #[serde(default)]
-    encryption_strategy: mxbot_common::config::EncryptionStrategy,
-    #[serde(default)]
-    verification: mxbot_common::config::VerificationConfig,
-}
-
-// ── Bot state ─────────────────────────────────────────────────────────────────
-
-#[derive(Clone)]
-struct BotState {
-    bot_user_id: OwnedUserId,
-    allowed_inviters: UserAllowList,
-    allowed_rooms: RoomAllowList,
-    admin_users: HashSet<OwnedUserId>,
-    verification: VerificationService,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -401,50 +301,6 @@ fn format_message(
 
 // ── Reliability helpers ──────────────────────────────────────────────────────
 
-/// Bounded exponential backoff with jitter for indefinite retry loops
-/// (Telegram/Matrix reconnects). Never gives up — callers decide when a
-/// failure is permanent and should stop retrying instead.
-struct Backoff {
-    base: Duration,
-    max: Duration,
-    current: Duration,
-}
-
-impl Backoff {
-    fn new(base: Duration, max: Duration) -> Self {
-        Self {
-            base,
-            max,
-            current: base,
-        }
-    }
-
-    /// Resets the delay back to `base`. Call this after a successful
-    /// operation so a later failure doesn't inherit a long-since-stale delay.
-    fn reset(&mut self) {
-        self.current = self.base;
-    }
-
-    /// Returns the delay to wait before the next attempt (base delay plus
-    /// up to ~20% jitter) and doubles the underlying delay, capped at `max`.
-    fn next_delay(&mut self) -> Duration {
-        let max_jitter_ms = ((self.current.as_millis() as u64) / 5).clamp(50, 30_000);
-        let jitter_ms = (jitter_nanos() as u64) % (max_jitter_ms + 1);
-        let delay = self.current + Duration::from_millis(jitter_ms);
-        self.current = (self.current * 2).min(self.max);
-        delay
-    }
-}
-
-/// Cheap, dependency-free source of pseudo-randomness for jitter. Does not
-/// need to be cryptographically strong — it only spreads out retry timing.
-fn jitter_nanos() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u128)
-        .unwrap_or(0)
-}
-
 /// Classifies a Telegram [`InvocationError`] as permanent (retrying is
 /// pointless, e.g. the account was logged out or banned) vs transient
 /// (network hiccup, temporary server issue — safe to retry indefinitely).
@@ -538,7 +394,7 @@ async fn write_last_id(path: &std::path::Path, id: i32) {
 async fn backfill(
     tg: &TgClient,
     channel_peer: &grammers_client::peer::Peer,
-    matrix: &MatrixClient,
+    matrix: &Bot,
     last_id: i32,
     history_limit: usize,
     last_id_path: &std::path::Path,
@@ -602,8 +458,8 @@ async fn backfill(
 /// reject uploads well below this anyway.
 const MAX_MEDIA_BYTES: usize = 100 * 1024 * 1024;
 
-async fn send_text_to_rooms(matrix: &MatrixClient, plain: &str, html: &str, tg_msg_id: i32) {
-    let rooms = matrix.joined_rooms();
+async fn send_text_to_rooms(matrix: &Bot, plain: &str, html: &str, tg_msg_id: i32) {
+    let rooms = matrix.broadcast_rooms();
     if rooms.is_empty() {
         warn!(
             tg_msg_id,
@@ -626,7 +482,7 @@ async fn send_text_to_rooms(matrix: &MatrixClient, plain: &str, html: &str, tg_m
 }
 
 /// Download a Telegram media item and send it to all joined Matrix rooms.
-async fn send_media_to_rooms(tg: &TgClient, matrix: &MatrixClient, media: &Media, tg_msg_id: i32) {
+async fn send_media_to_rooms(tg: &TgClient, matrix: &Bot, media: &Media, tg_msg_id: i32) {
     let (mime_str, filename) = match media {
         Media::Photo(_) => ("image/jpeg".to_owned(), "photo.jpg".to_owned()),
         Media::Document(doc) => {
@@ -694,7 +550,7 @@ async fn send_media_to_rooms(tg: &TgClient, matrix: &MatrixClient, media: &Media
         (0, 0)
     };
 
-    let rooms = matrix.joined_rooms();
+    let rooms = matrix.broadcast_rooms();
     if rooms.is_empty() {
         warn!("No joined Matrix rooms — media dropped");
         return;
@@ -763,7 +619,7 @@ fn media_dimensions(data: &[u8]) -> (u32, u32) {
 }
 
 /// Forward one Telegram message (text and/or media) to all Matrix rooms.
-async fn forward_message(tg: &TgClient, matrix: &MatrixClient, msg: &TgMessage) {
+async fn forward_message(tg: &TgClient, matrix: &Bot, msg: &TgMessage) {
     let msg_id = msg.id();
     // Send media first (mirrors Telegram's layout: image above caption)
     if let Some(media) = msg.media() {
@@ -782,22 +638,12 @@ async fn forward_message(tg: &TgClient, matrix: &MatrixClient, msg: &TgMessage) 
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "telegram_mirror_bot=info,matrix_sdk=warn".parse().unwrap()),
-        )
-        .init();
+    mxbot_common::logging::init("telegram_mirror_bot");
 
-    let config_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "config.toml".to_owned());
-    let config_str = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("Failed to read config: {config_path}"))?;
-    let config: Config = toml::from_str(&config_str)?;
+    let config: Config =
+        mxbot_common::config::load_toml(&mxbot_common::config::config_path_from_args())?;
 
-    let store_path =
-        PathBuf::from(std::env::var("STORE_PATH").unwrap_or_else(|_| "store".to_owned()));
+    let store_path = mxbot_common::config::store_path_from_env();
     fs::create_dir_all(&store_path).await?;
 
     // A liveness heartbeat for `docker healthcheck`: touched on a fixed timer by a task
@@ -845,242 +691,29 @@ async fn main() -> Result<()> {
 
     // ── Matrix client ─────────────────────────────────────────────────────────
 
-    let (matrix, user_id) = mxbot_common::session::build_and_restore(
-        &config.matrix,
-        &store_path,
-        config.security.encryption_strategy.into(),
-    )
-    .await?;
+    let matrix = Bot::builder("telegram-mirror-bot", env!("CARGO_PKG_VERSION"))
+        .store_path(&store_path)
+        .start(&config.matrix, &config.security)
+        .await?;
 
-    let allowed_inviters: UserAllowList = match &config.security.allowed_inviters {
-        RawAllowList::Wildcard(s) if s == "all" => UserAllowList::All,
-        RawAllowList::Wildcard(s) => anyhow::bail!(
-            "Invalid allowed_inviters value: {:?} (expected \"all\" or a list)",
-            s
-        ),
-        RawAllowList::List(list) if list.is_empty() => UserAllowList::Deny,
-        RawAllowList::List(list) => {
-            let mut set = HashSet::new();
-            for s in list {
-                let uid = s.parse::<OwnedUserId>().with_context(|| {
-                    format!("Invalid Matrix user ID in allowed_inviters: {:?}", s)
-                })?;
-                set.insert(uid);
-            }
-            UserAllowList::Explicit(set)
-        }
-    };
-
-    let allowed_rooms: RoomAllowList = match &config.security.allowed_rooms {
-        RawAllowList::Wildcard(s) if s == "all" => RoomAllowList::All,
-        RawAllowList::Wildcard(s) => anyhow::bail!(
-            "Invalid allowed_rooms value: {:?} (expected \"all\" or a list)",
-            s
-        ),
-        RawAllowList::List(list) if list.is_empty() => RoomAllowList::Deny,
-        RawAllowList::List(list) => {
-            let mut set = HashSet::new();
-            for s in list {
-                let rid = s
-                    .parse::<matrix_sdk::ruma::OwnedRoomId>()
-                    .with_context(|| format!("Invalid Matrix room ID in allowed_rooms: {:?}", s))?;
-                set.insert(rid);
-            }
-            RoomAllowList::Explicit(set)
-        }
-    };
-
-    if allowed_inviters.is_deny_all() {
-        warn!("allowed_inviters = [] — bot will reject all invites");
-    } else if allowed_inviters.is_allow_all() {
-        warn!("allowed_inviters = \"all\" — bot will accept invites from any Matrix user");
-    } else {
-        info!(
-            "Allowed inviters configured (explicit list, {} user(s))",
-            allowed_inviters.explicit_count().unwrap_or(0)
-        );
-    }
-    if allowed_rooms.is_deny_all() {
-        warn!("allowed_rooms = [] — bot will not operate in any room");
-    } else if allowed_rooms.is_allow_all() {
-        info!("allowed_rooms = \"all\" — bot will operate in any joined room");
-    } else {
-        info!(
-            "Allowed rooms configured (explicit list, {} room(s))",
-            allowed_rooms.explicit_count().unwrap_or(0)
-        );
-    }
-
-    let admin_users: HashSet<OwnedUserId> = config
-        .security
-        .admin_users
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
-
-    if admin_users.is_empty() {
-        warn!("No admin_users configured — !reset-trust command is disabled");
-    } else {
-        info!("Admin users: {admin_users:?}");
-    }
-
-    let verification_fallback = match &allowed_inviters {
-        UserAllowList::Explicit(users) => users.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        UserAllowList::All | UserAllowList::Deny => Vec::new(),
-    };
-    let verification = VerificationService::allowlisted_tofu_from_config(
-        matrix.clone(),
-        &config.security.verification,
-        &verification_fallback,
-    );
-    verification.install_handlers();
-
-    let bot_state = BotState {
-        bot_user_id: user_id,
-        allowed_inviters: allowed_inviters.clone(),
-        allowed_rooms: allowed_rooms.clone(),
-        admin_users,
-        verification,
-    };
-
-    // Invite handler
-    matrix.add_event_handler({
-        let state = bot_state.clone();
-        move |ev: StrippedRoomMemberEvent, room: Room, client: MatrixClient| {
-            let state = state.clone();
+    // Room messages: only the shared admin console applies here.
+    matrix.client.add_event_handler({
+        let admin = matrix.admin.clone();
+        move |ev: OriginalSyncRoomMessageEvent, room: Room, encryption: Option<EncryptionInfo>| {
+            let admin = admin.clone();
             async move {
-                if ev.state_key != state.bot_user_id {
-                    return;
-                }
-                if !state.allowed_inviters.allows(&ev.sender) {
-                    warn!("Rejecting invite from {}: inviter not in allowed_inviters", ev.sender);
-                    room.leave().await.ok();
-                    return;
-                }
-                if !state.allowed_rooms.allows(room.room_id()) {
-                    warn!("Rejecting invite to {}: room not in allowed_rooms", room.room_id());
-                    room.leave().await.ok();
-                    return;
-                }
-                info!("Accepted invite from {} to {}", ev.sender, room.room_id());
-                let room_id = room.room_id().to_owned();
-                let mut via: Vec<OwnedServerName> = vec![ev.sender.server_name().to_owned()];
-                if let Some(s) = room_id.server_name() {
-                    let s = s.to_owned();
-                    if !via.contains(&s) {
-                        via.push(s);
-                    }
-                }
-                let room_or_alias = match RoomOrAliasId::parse(room_id.as_str()) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        error!("Invalid room ID {room_id}: {e}");
-                        return;
-                    }
-                };
-                tokio::spawn(async move {
-                    let mut delay = 2u64;
-                    const MAX_ATTEMPTS: u32 = 8;
-                    for attempt in 1..=MAX_ATTEMPTS {
-                        match client.join_room_by_id_or_alias(&room_or_alias, &via).await {
-                            Ok(_) => {
-                                info!("Joined {room_id}");
-                                return;
-                            }
-                            Err(ref e) if mxbot_common::verify::is_join_terminal(e) => {
-                                warn!("Join failed (terminal) for {room_id}: {e}");
-                                return;
-                            }
-                            Err(e) if attempt == MAX_ATTEMPTS => {
-                                warn!("Join failed after {MAX_ATTEMPTS} attempts for {room_id}: {e}");
-                            }
-                            Err(e) => {
-                                warn!("Join attempt {attempt}/{MAX_ATTEMPTS} failed for {room_id}: {e}; retry in {delay}s");
-                                sleep(Duration::from_secs(delay)).await;
-                                delay = (delay * 2).min(300);
-                            }
-                        }
-                    }
-                });
-            }
-        }
-    });
-
-    // In-room verification requests are handled by mxbot-common.
-    matrix.add_event_handler({
-        let state = bot_state.clone();
-        move |ev: OriginalSyncRoomMessageEvent, room: Room| {
-            let state = state.clone();
-            async move {
-                if ev.sender == state.bot_user_id || room.state() != RoomState::Joined {
-                    return;
-                }
-                match &ev.content.msgtype {
-                    MessageType::VerificationRequest(_) => {}
-                    MessageType::Text(text) => {
-                        let body = text.body.trim();
-                        state
-                            .verification
-                            .handle_admin_command(&ev.sender, &state.admin_users, body)
-                            .await;
-                    }
-                    _ => {}
+                if room.state() == RoomState::Joined {
+                    admin.handle(&room, &ev, encryption.as_ref()).await;
                 }
             }
         }
     });
 
-    // Do an initial sync so the bot knows which rooms it has joined, then spawn continuous sync.
-    // A handful of retries absorbs the kind of transient homeserver hiccup we've seen in
-    // production (503 "Unable to introspect the access token") without failing startup outright.
+    // Do an initial sync so the bot knows which rooms it has joined (also
+    // joins invites received while offline), then spawn continuous sync.
     info!("Performing initial Matrix sync...");
-    mxbot_common::retry::retry_with_backoff(5, 2, "initial Matrix sync", || {
-        let matrix = matrix.clone();
-        async move {
-            let filter = FilterDefinition::with_lazy_loading();
-            matrix
-                .sync_once(SyncSettings::default().filter(filter.into()))
-                .await
-        }
-    })
-    .await?;
+    matrix.initial_sync().await;
     info!("Initial sync complete");
-
-    // Drain pending invites from prior sessions.
-    let invited = matrix.invited_rooms();
-    if !invited.is_empty() {
-        info!(
-            "Pending invite(s) found after initial sync — processing {} room(s)",
-            invited.len()
-        );
-        for room in invited {
-            let room_id = room.room_id().to_owned();
-            // Inviter info is unavailable when replaying from the store.
-            if allowed_inviters.is_deny_all() {
-                warn!("Pending invite to {room_id} declined: allowed_inviters = []");
-                room.leave().await.ok();
-                continue;
-            }
-            if !allowed_rooms.allows(&room_id) {
-                warn!("Pending invite to {room_id} declined: room not in allowed_rooms");
-                room.leave().await.ok();
-                continue;
-            }
-            let via: Vec<OwnedServerName> = room_id
-                .server_name()
-                .map(|s| vec![s.to_owned()])
-                .unwrap_or_default();
-            match RoomOrAliasId::parse(room_id.as_str()) {
-                Ok(room_or_alias) => {
-                    match matrix.join_room_by_id_or_alias(&room_or_alias, &via).await {
-                        Ok(_) => info!("Joined pending invite room {room_id}"),
-                        Err(e) => warn!("Failed to join pending invite room {room_id}: {e}"),
-                    }
-                }
-                Err(e) => warn!("Invalid room ID in pending invite {room_id}: {e}"),
-            }
-        }
-    }
 
     // ── Run Telegram update loop and Matrix sync concurrently ─────────────────
     //
@@ -1089,7 +722,10 @@ async fn main() -> Result<()> {
     // The whole process only exits on a genuinely unrecoverable error, or on
     // SIGTERM/SIGINT for a clean shutdown.
 
-    let matrix_sync_handle = tokio::spawn(run_matrix_sync(matrix.clone()));
+    let matrix_sync_handle = tokio::spawn({
+        let matrix = matrix.clone();
+        async move { matrix.sync_forever().await }
+    });
 
     tokio::select! {
         _ = shutdown_signal() => {
@@ -1110,8 +746,7 @@ async fn main() -> Result<()> {
         }
         res = matrix_sync_handle => {
             match res {
-                Ok(Ok(())) => Err(anyhow::anyhow!("Matrix sync task exited unexpectedly")),
-                Ok(Err(e)) => Err(anyhow::anyhow!("Matrix sync task exited unexpectedly: {e}")),
+                Ok(()) => Err(anyhow::anyhow!("Matrix sync task exited unexpectedly")),
                 Err(e) => Err(anyhow::anyhow!("Matrix sync task panicked: {e}")),
             }
         }
@@ -1145,32 +780,6 @@ async fn shutdown_signal() {
     }
 }
 
-/// Drives the Matrix `/sync` loop forever, reconnecting with backoff on any
-/// error. Matrix sync failures (as seen in production: transient homeserver
-/// 503s) never take down the Telegram side.
-async fn run_matrix_sync(matrix: MatrixClient) -> Result<()> {
-    let mut backoff = Backoff::new(Duration::from_secs(2), Duration::from_secs(120));
-    loop {
-        let started = std::time::Instant::now();
-        let filter = FilterDefinition::with_lazy_loading();
-        match matrix
-            .sync(SyncSettings::default().filter(filter.into()))
-            .await
-        {
-            Ok(()) => warn!("Matrix sync exited cleanly — reconnecting"),
-            Err(e) => warn!("Matrix sync error (transient): {e} — reconnecting"),
-        }
-        // A sync that stayed up for a while was healthy; don't let one late
-        // hiccup inherit a long backoff built up from earlier failures.
-        if started.elapsed() > Duration::from_secs(60) {
-            backoff.reset();
-        }
-        let delay = backoff.next_delay();
-        info!("Matrix sync reconnecting in {delay:?}");
-        sleep(delay).await;
-    }
-}
-
 /// Drives Telegram update ingestion forever: resolves the target channel,
 /// catches up on anything missed since `last_id`, then forwards live
 /// messages. Reconnects (rebuilding the whole [`SenderPool`]) whenever the
@@ -1186,10 +795,10 @@ async fn run_telegram_bridge(
     history_limit: usize,
     mut tg: TgClient,
     mut updates: mpsc::UnboundedReceiver<UpdatesLike>,
-    matrix: MatrixClient,
+    matrix: Bot,
     last_id_path: PathBuf,
 ) -> Result<()> {
-    let mut backoff = Backoff::new(Duration::from_secs(2), Duration::from_secs(120));
+    let mut backoff = Backoff::new(Duration::from_secs(2), Duration::from_secs(120)).with_jitter();
 
     'reconnect: loop {
         let channel_peer = loop {
@@ -1307,34 +916,6 @@ async fn run_telegram_bridge(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn backoff_doubles_and_caps() {
-        // next_delay() adds up to ~20% jitter on top of the base delay, so assert ranges
-        // rather than exact values.
-        let mut b = Backoff::new(Duration::from_secs(2), Duration::from_secs(10));
-        let d1 = b.next_delay();
-        assert!(d1 >= Duration::from_secs(2) && d1 <= Duration::from_millis(2_400));
-        let d2 = b.next_delay();
-        assert!(d2 >= Duration::from_secs(4) && d2 <= Duration::from_millis(4_800));
-        let d3 = b.next_delay();
-        assert!(d3 >= Duration::from_secs(8) && d3 <= Duration::from_millis(9_600));
-        // Capped at `max` from here on, regardless of how many more calls happen.
-        for _ in 0..5 {
-            let d = b.next_delay();
-            assert!(d >= Duration::from_secs(10) && d <= Duration::from_secs(12));
-        }
-    }
-
-    #[test]
-    fn backoff_reset_returns_to_base() {
-        let mut b = Backoff::new(Duration::from_secs(2), Duration::from_secs(300));
-        b.next_delay();
-        b.next_delay();
-        b.reset();
-        let d = b.next_delay();
-        assert!(d >= Duration::from_secs(2) && d < Duration::from_secs(3));
-    }
 
     fn rpc_error(name: &str) -> InvocationError {
         InvocationError::Rpc(grammers_client::sender::RpcError {

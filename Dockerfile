@@ -1,9 +1,4 @@
 # syntax=docker/dockerfile:1
-#
-# Build via build-bots.sh which injects the local matrix-rust-sdk as a named
-# build context (--build-context matrix-sdk=...).  Cargo.toml patches resolve
-# path = "../matrix-rust-sdk" against WORKDIR /build → /matrix-rust-sdk.
-#
 # ── Base: chef + build deps ───────────────────────────────────────────────────
 FROM rust:1.98.1-slim-bookworm AS chef
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,10 +19,8 @@ ENV RUSTC_WRAPPER=sccache \
     CARGO_INCREMENTAL=0
 WORKDIR /build
 
-# ── Planner ───────────────────────────────────────────────────────────────────
+# ── Planner: capture the full dependency graph ────────────────────────────────
 FROM chef AS planner
-# Inject the SDK from the named build context before analysing deps.
-COPY --from=matrix-sdk . /matrix-rust-sdk/
 COPY . .
 RUN --mount=type=cache,id=shared-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=shared-cargo-registry,target=/usr/local/cargo/registry \
@@ -35,7 +28,6 @@ RUN --mount=type=cache,id=shared-cargo-git,target=/usr/local/cargo/git \
 
 # ── Builder ───────────────────────────────────────────────────────────────────
 FROM chef AS builder
-COPY --from=matrix-sdk . /matrix-rust-sdk/
 COPY --from=planner /build/recipe.json recipe.json
 
 RUN --mount=type=cache,id=shared-cargo-git,target=/usr/local/cargo/git \
@@ -44,9 +36,6 @@ RUN --mount=type=cache,id=shared-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=telegram-mirror-bot-target,target=/build/target \
     cargo chef cook --release --recipe-path recipe.json
 
-# cargo-chef writes path-dependency skeletons while cooking the recipe. Restore
-# the real SDK workspace before the final locked build.
-COPY --from=matrix-sdk . /matrix-rust-sdk/
 COPY . .
 RUN --mount=type=cache,id=shared-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=shared-cargo-registry,target=/usr/local/cargo/registry \
