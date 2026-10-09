@@ -408,6 +408,7 @@ async fn backfill(
     let peer_ref = channel_peer
         .to_ref()
         .await
+        .map_err(|e| anyhow::anyhow!("Could not look up the channel peer: {e}"))?
         .context("Channel peer has no access hash: cannot fetch history")?;
 
     info!(
@@ -821,7 +822,7 @@ async fn run_telegram_bridge(
             warn!(chat = %channel, "Backfill failed: {e}, continuing with live updates only");
         }
 
-        let mut update_stream = tg
+        let mut update_stream = match tg
             .stream_updates(
                 updates,
                 UpdatesConfiguration {
@@ -829,7 +830,20 @@ async fn run_telegram_bridge(
                     ..Default::default()
                 },
             )
-            .await;
+            .await
+        {
+            Ok(stream) => stream,
+            Err(e) => {
+                // The receiver is spent, so start over with a fresh pool.
+                let delay = backoff.next_delay();
+                warn!(chat = %channel, "Could not start the Telegram update stream: {e}, retrying in {delay:?}");
+                sleep(delay).await;
+                let (new_tg, new_updates) = spawn_sender_pool(&session, api_id);
+                tg = new_tg;
+                updates = new_updates;
+                continue 'reconnect;
+            }
+        };
         info!(chat = %channel, "Listening for Telegram updates");
         backoff.reset();
 

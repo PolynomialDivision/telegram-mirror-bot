@@ -10,9 +10,12 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 futures-util = "0.3"
-grammers-client = "0.9"
-grammers-session = "0.9"
-grammers-tl-types = "0.9"
+grammers-client = "0.10"
+grammers-session = "0.10"
+grammers-tl-types = "0.10"
+# grammers-crypto 0.10 asks for ^2.0.0-rc0 but does not build with rc1.
+# Drop this pin once a grammers release builds with a newer glass_pumpkin.
+glass_pumpkin = "=2.0.0-rc0"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 mime = "0.3"
 mxbot-common = { git = "https://github.com/PolynomialDivision/mxbot-common" }
