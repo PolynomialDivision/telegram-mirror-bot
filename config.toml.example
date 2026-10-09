@@ -3,7 +3,7 @@
 api_id = 12345
 api_hash = "your_api_hash_here"
 
-# Your personal phone number — used for the first-time interactive login
+# Your personal phone number: used for the first-time interactive login
 phone = "+49123456789"
 
 # Public channel username to mirror (without @)
@@ -25,26 +25,26 @@ device_id = "YOUR_DEVICE_ID"
 
 [security]
 # Who may invite the bot:
-#   "all"                      — accept invites from any Matrix user
-#   []                         — reject all invites
-#   ["@you:matrix.org"]        — explicit allowlist
+#   "all": accept invites from any Matrix user
+#   []: reject all invites
+#   ["@you:matrix.org"]: explicit allowlist
 allowed_inviters = ["@you:matrix.org"]
 
 # Rooms the bot may join and mirror into:
-#   "all"                      — operate in any room
-#   []                         — refuse to operate in any room
-#   ["!roomid:matrix.org"]     — explicit allowlist
+#   "all": operate in any room
+#   []: refuse to operate in any room
+#   ["!roomid:matrix.org"]: explicit allowlist
 # Both allowed_inviters and allowed_rooms must pass before an invite is accepted.
 allowed_rooms = "all"
 
-# Users allowed to run admin commands — in shared rooms and privately in a
+# Users allowed to run admin commands, privately in a
 # direct chat with the bot (send !admin there for help).
 admin_users = ["@you:matrix.org"]
 
 # Which devices receive room keys:
-#   identity_based  — only cross-signed devices (default, recommended)
-#   only_trusted    — only explicitly verified devices
-#   all_devices     — all devices, no restriction
+#   identity_based: only cross-signed devices (default, recommended)
+#   only_trusted: only explicitly verified devices
+#   all_devices: all devices, no restriction
 encryption_strategy = "identity_based"
 
 [security.verification]

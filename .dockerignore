@@ -1,4 +1,4 @@
-# Credentials — mounted at runtime, never part of the image
+# Credentials: mounted at runtime, never part of the image
 config.toml
 config.*.toml
 .env

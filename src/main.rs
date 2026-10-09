@@ -303,7 +303,7 @@ fn format_message(
 
 /// Classifies a Telegram [`InvocationError`] as permanent (retrying is
 /// pointless, e.g. the account was logged out or banned) vs transient
-/// (network hiccup, temporary server issue — safe to retry indefinitely).
+/// (network hiccup, temporary server issue: safe to retry indefinitely).
 fn is_terminal_telegram_error(err: &InvocationError) -> bool {
     match err {
         InvocationError::Rpc(rpc) => matches!(
@@ -327,7 +327,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Periodically touches a file so an external health check can tell "the
 /// process is alive but the runtime is wedged" apart from "still running
-/// normally". Errors are logged once but never fatal — a broken heartbeat
+/// normally". Errors are logged once but never fatal. A broken heartbeat
 /// file should not take the bot down.
 async fn heartbeat_loop(path: PathBuf) {
     loop {
@@ -347,7 +347,7 @@ fn unix_now_secs() -> u64 {
 
 /// (Re)builds a Telegram connection: a fresh [`SenderPool`], its client
 /// handle, and the raw update receiver. The pool's driver task is spawned
-/// and supervised here — if it ever exits (e.g. because of a panic deep in
+/// and supervised here. If it ever exits (e.g. because of a panic deep in
 /// the transport layer), that is logged instead of silently vanishing, and
 /// the closed `updates` channel is what lets [`InvocationError::Dropped`]
 /// surface to callers so they know to reconnect.
@@ -364,7 +364,7 @@ fn spawn_sender_pool(
     tokio::spawn(async move {
         runner.run().await;
         error!(
-            "Telegram connection pool task exited unexpectedly — Telegram updates will reconnect"
+            "Telegram connection pool task exited unexpectedly: Telegram updates will reconnect"
         );
     });
     (tg, updates)
@@ -408,7 +408,7 @@ async fn backfill(
     let peer_ref = channel_peer
         .to_ref()
         .await
-        .context("Channel peer has no access hash — cannot fetch history")?;
+        .context("Channel peer has no access hash: cannot fetch history")?;
 
     info!(
         "Fetching history (last_id={last_id}, history_limit={history_limit}, first_run={is_first_run})"
@@ -463,7 +463,7 @@ async fn send_text_to_rooms(matrix: &Bot, plain: &str, html: &str, tg_msg_id: i3
     if rooms.is_empty() {
         warn!(
             tg_msg_id,
-            "telegram->matrix: no joined Matrix rooms — message dropped"
+            "telegram->matrix: no joined Matrix rooms, message dropped"
         );
         return;
     }
@@ -522,7 +522,7 @@ async fn send_media_to_rooms(tg: &TgClient, matrix: &Bot, media: &Media, tg_msg_
                     warn!(
                         tg_msg_id,
                         limit_bytes = MAX_MEDIA_BYTES,
-                        "Media exceeds size limit — skipping attachment"
+                        "Media exceeds size limit: skipping attachment"
                     );
                     return;
                 }
@@ -552,7 +552,7 @@ async fn send_media_to_rooms(tg: &TgClient, matrix: &Bot, media: &Media, tg_msg_
 
     let rooms = matrix.broadcast_rooms();
     if rooms.is_empty() {
-        warn!("No joined Matrix rooms — media dropped");
+        warn!("No joined Matrix rooms: media dropped");
         return;
     }
     for room in rooms {
@@ -608,7 +608,7 @@ async fn send_media_to_rooms(tg: &TgClient, matrix: &Bot, media: &Media, tg_msg_
 
 /// Extract pixel dimensions from image bytes without full decode.
 /// Supports JPEG, PNG, and WebP (Telegram's three image formats).
-/// Returns (0, 0) on failure — callers treat 0 as "unknown".
+/// Returns (0, 0) on failure. Callers treat 0 as "unknown".
 fn media_dimensions(data: &[u8]) -> (u32, u32) {
     use std::io::Cursor;
     image::ImageReader::new(Cursor::new(data))
@@ -648,7 +648,7 @@ async fn main() -> Result<()> {
 
     // A liveness heartbeat for `docker healthcheck`: touched on a fixed timer by a task
     // independent of Matrix/Telegram traffic, so it keeps ticking through quiet periods but
-    // stalls if the async runtime itself wedges (e.g. a deadlock) — the one failure mode that
+    // stalls if the async runtime itself wedges (e.g. a deadlock). The one failure mode that
     // "the process is still running" can't detect on its own.
     tokio::spawn(heartbeat_loop(store_path.join(".heartbeat")));
 
@@ -664,7 +664,7 @@ async fn main() -> Result<()> {
     let (tg, updates) = spawn_sender_pool(&session, config.telegram.api_id);
 
     if !tg.is_authorized().await? {
-        info!("Not signed in — starting interactive login");
+        info!("Not signed in: starting interactive login");
         let token = tg
             .request_login_code(&config.telegram.phone, &config.telegram.api_hash)
             .await
@@ -775,12 +775,12 @@ async fn run_telegram_bridge(
             match tg.resolve_username(&channel).await {
                 Ok(Some(peer)) => break peer,
                 Ok(None) => {
-                    error!(chat = %channel, "Configured Telegram channel not found — giving up");
+                    error!(chat = %channel, "Configured Telegram channel not found: giving up");
                     return Err(anyhow::anyhow!("Telegram channel '{channel}' not found"));
                 }
                 Err(InvocationError::Dropped) => {
                     let delay = backoff.next_delay();
-                    warn!(chat = %channel, ?delay, "Telegram connection pool is gone while resolving channel — reconnecting");
+                    warn!(chat = %channel, ?delay, "Telegram connection pool is gone while resolving channel: reconnecting");
                     sleep(delay).await;
                     let (new_tg, new_updates) = spawn_sender_pool(&session, api_id);
                     tg = new_tg;
@@ -792,7 +792,7 @@ async fn run_telegram_bridge(
                 }
                 Err(e) => {
                     let delay = backoff.next_delay();
-                    warn!(chat = %channel, "Failed to resolve Telegram channel: {e} (transient) — retrying in {delay:?}");
+                    warn!(chat = %channel, "Failed to resolve Telegram channel: {e} (transient), retrying in {delay:?}");
                     sleep(delay).await;
                 }
             }
@@ -806,7 +806,7 @@ async fn run_telegram_bridge(
         backoff.reset();
 
         // Catch up on anything sent while we were disconnected (also covers the very first run).
-        // A failure here is not fatal — live updates still start.
+        // A failure here is not fatal: live updates still start.
         let last_id = read_last_id(&last_id_path).await;
         if let Err(e) = backfill(
             &tg,
@@ -818,7 +818,7 @@ async fn run_telegram_bridge(
         )
         .await
         {
-            warn!(chat = %channel, "Backfill failed: {e} — continuing with live updates only");
+            warn!(chat = %channel, "Backfill failed: {e}, continuing with live updates only");
         }
 
         let mut update_stream = tg
@@ -853,7 +853,7 @@ async fn run_telegram_bridge(
                 Ok(_) => {}
                 Err(InvocationError::Dropped) => {
                     let delay = backoff.next_delay();
-                    warn!(chat = %channel, ?delay, "Telegram connection pool is gone — reconnecting");
+                    warn!(chat = %channel, ?delay, "Telegram connection pool is gone: reconnecting");
                     sleep(delay).await;
                     let (new_tg, new_updates) = spawn_sender_pool(&session, api_id);
                     tg = new_tg;
@@ -865,7 +865,7 @@ async fn run_telegram_bridge(
                     warn!(
                         chat = %channel,
                         retry_after_s = wait,
-                        "Telegram rate limit (FLOOD_WAIT) — honoring retry_after"
+                        "Telegram rate limit (FLOOD_WAIT): honoring retry_after"
                     );
                     sleep(Duration::from_secs(wait as u64)).await;
                 }
@@ -875,7 +875,7 @@ async fn run_telegram_bridge(
                 }
                 Err(e) => {
                     let delay = backoff.next_delay();
-                    warn!(chat = %channel, "Telegram update stream error (transient): {e} — retrying in {delay:?}");
+                    warn!(chat = %channel, "Telegram update stream error (transient): {e}, retrying in {delay:?}");
                     sleep(delay).await;
                 }
             }
