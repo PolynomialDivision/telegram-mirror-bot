@@ -29,6 +29,8 @@ device_id = "YOUR_DEVICE_ID"
 #   []: reject all invites
 #   ["@you:matrix.org"]: explicit allowlist
 allowed_inviters = ["@you:matrix.org"]
+# Members of these rooms may also open a private chat with the bot.
+# dm_rooms = ["!REPLACE_ME:example.org"]
 
 # Rooms the bot may join and mirror into:
 #   "all": operate in any room
