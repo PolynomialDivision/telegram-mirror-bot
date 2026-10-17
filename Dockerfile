@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # ── Base: chef + build deps ───────────────────────────────────────────────────
-FROM rust:1.99.0-slim-bookworm AS chef
+FROM rust:1.99.1-slim-bookworm AS chef
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*
