@@ -2,11 +2,20 @@
 # ── Base: chef + build deps ───────────────────────────────────────────────────
 FROM rust:1.99.1-slim-bookworm AS chef
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev libsqlite3-dev \
+    pkg-config libssl-dev libsqlite3-dev xz-utils \
     && rm -rf /var/lib/apt/lists/*
-# sccache (via openssl-sys) needs pkg-config/libssl-dev at its own build
-# time, so this must come after the apt-get above.
-RUN cargo install cargo-chef sccache --locked
+# cargo-chef and sccache as their released static binaries, pinned by checksum, instead
+# of compiling both in every bot's build (about 3.5 minutes on a cold BuildKit cache,
+# 2026-10-21). To upgrade: the new release's URLs and their sha256 (the release lists them).
+ADD --checksum=sha256:aca691abfbfbbe00d482e0ed2249eec3091b65e96a0ce92947fb5b254d48b16d \
+    https://github.com/LukeMathWalker/cargo-chef/releases/download/v0.1.78/cargo-chef-x86_64-unknown-linux-musl.tar.xz /tmp/cargo-chef.tar.xz
+ADD --checksum=sha256:45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89 \
+    https://github.com/mozilla/sccache/releases/download/v0.18.0/sccache-v0.18.0-x86_64-unknown-linux-musl.tar.gz /tmp/sccache.tar.gz
+RUN tar -xJf /tmp/cargo-chef.tar.xz --strip-components=1 -C /usr/local/cargo/bin \
+        cargo-chef-x86_64-unknown-linux-musl/cargo-chef \
+    && tar -xzf /tmp/sccache.tar.gz --strip-components=1 -C /usr/local/cargo/bin \
+        sccache-v0.18.0-x86_64-unknown-linux-musl/sccache \
+    && rm /tmp/cargo-chef.tar.xz /tmp/sccache.tar.gz
 
 # sccache wraps rustc so identical compilation work (e.g. the matrix-sdk /
 # ruma / mxbot-common dependency graph shared by these bots) is reused from
