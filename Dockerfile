@@ -69,11 +69,12 @@ VOLUME /app/store
 VOLUME /app/config
 WORKDIR /app
 
-# The bot touches store/.heartbeat every ~30s from a task independent of Matrix/Telegram
-# traffic, so a stale file means the async runtime itself is wedged (deadlock), not just
-# "no messages recently". A missing binary/crashed process is already caught by Docker's
-# own container-state tracking; this check is for the "running but stuck" case that leaves.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
-    CMD sh -c 'f=store/.heartbeat; [ -f "$f" ] && [ $(( $(date +%s) - $(stat -c %Y "$f") )) -lt 90 ]'
+# mxbot-common's heartbeat: the bot writes the Unix time into this file after every
+# successful Matrix sync (long polling returns at least every 30 s), so a stale file means the
+# sync is dead or the runtime is wedged. Set here so the image is healthy on its own; house-infra
+# with `heartbeat: true` sets the same variable and the same check in compose.
+ENV MXBOT_HEARTBEAT_FILE=/app/store/.heartbeat
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+    CMD sh -c 'f="$MXBOT_HEARTBEAT_FILE"; [ -f "$f" ] && [ $(( $(date +%s) - $(cat "$f") )) -lt 120 ]'
 
 CMD ["telegram-mirror-bot", "/app/config/config.toml"]

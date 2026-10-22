@@ -1,0 +1,35 @@
+# Rendered by Ansible from stacks/matrix-bots/secrets/telegram-mirror-bot.config.toml.j2. Do not edit on the host.
+[matrix]
+homeserver = "http://tuwunel:8008"
+user_id = "@telegram-mirror-bot:example.org"
+device_id = "HOUSEINFRATELEGRAMMIRRORBOT"
+# access_token: MATRIX_ACCESS_TOKEN from session/matrix.env (roles/matrix_accounts).
+
+[security]
+admin_users = ["@admin:example.org", "@admin2:matrix.org"]
+allowed_inviters = ["@admin:example.org", "@admin2:matrix.org"]
+allowed_rooms = ["!nXq65jGaKnw-RzNHa45SQdCBpmhV3yZOiD5vZlKucZo"]
+dm_rooms = ["!nXq65jGaKnw-RzNHa45SQdCBpmhV3yZOiD5vZlKucZo"]
+encryption_strategy = "identity_based"
+# verified: a person's identity as verified with the bot (!admin verify); a new identity stops
+# everything until they verify again. cross_signed: every device they signed with their
+# current identity; a new identity is accepted and logged (mxbot-common, 2026-10-19).
+trust = "cross_signed"
+
+[security.verification]
+allowed_users = []
+allow_users_from_joined_rooms = true
+
+[security.admin_dm]
+enabled = true
+require_encryption = true
+require_verified_device = false
+# Also the bot's broadcast posts (digests, reminders) into the admins' private chats.
+receive_broadcasts = false
+
+[telegram]
+api_id = 123456               # telegram_app in matrix.yml
+api_hash = "fake-not-a-secret-telegram-mirror-bot-api-hash"
+phone = "fake-not-a-secret-telegram-mirror-bot-phone"   # only for a new interactive login
+channel = "ZGKs38"
+history_limit = 50

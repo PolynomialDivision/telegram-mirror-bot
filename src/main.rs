@@ -16,6 +16,8 @@ use grammers_session::types::PeerId;
 use grammers_session::updates::UpdatesLike;
 use mxbot_common::{
     config::{MatrixConfig, SecurityConfig},
+    format::html_escape,
+    matrix_sdk::Error as MatrixError,
     matrix_sdk::{
         attachment::{
             AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
@@ -29,6 +31,7 @@ use mxbot_common::{
         Room, RoomState,
     },
     retry::Backoff,
+    send::{classify_error, send_with_retry},
     Bot,
 };
 use serde::Deserialize;
@@ -71,214 +74,113 @@ fn prompt(msg: &str) -> String {
     line.trim().to_owned()
 }
 
-fn html_escape_char(c: char) -> &'static str {
-    match c {
-        '<' => "&lt;",
-        '>' => "&gt;",
-        '&' => "&amp;",
-        '"' => "&quot;",
-        _ => "",
-    }
+/// Append `text` HTML-escaped, newlines as `<br>`.
+fn push_text(out: &mut String, text: &str) {
+    out.push_str(&html_escape(text).replace('\n', "<br>"));
 }
 
-fn html_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        let esc = html_escape_char(c);
-        if esc.is_empty() {
-            out.push(c);
-        } else {
-            out.push_str(esc);
-        }
+/// The href for a URL Telegram found in plain text: `example.com/x` (no scheme) would be a
+/// relative link in a Matrix client, so it gets `https://`.
+fn link_target(url: &str) -> String {
+    if url.contains("://") || url.starts_with("mailto:") || url.starts_with("tg:") {
+        url.to_owned()
+    } else {
+        format!("https://{url}")
     }
-    out
 }
 
 /// Convert Telegram message text + entities to Matrix-compatible HTML.
-/// Telegram entity offsets are UTF-16 code unit positions.
+/// Telegram entity offsets are UTF-16 code unit positions; they come from the network and
+/// are clamped to the text (and to whole characters), so a bad entity never panics.
 fn entities_to_html(text: &str, entities: &[tl::enums::MessageEntity]) -> String {
+    use std::cmp::Reverse;
+    use tl::enums::MessageEntity as E;
+
     let utf16: Vec<u16> = text.encode_utf16().collect();
+    let len = utf16.len();
+    let is_low_surrogate = |pos: usize| pos < len && (0xDC00..=0xDFFF).contains(&utf16[pos]);
+    // A position inside a surrogate pair moves before the pair (start) or after it (end).
+    let clamp = |raw: i64, is_start: bool| -> usize {
+        let pos = raw.clamp(0, len as i64) as usize;
+        match (is_low_surrogate(pos), is_start) {
+            (true, true) => pos - 1,
+            (true, false) => pos + 1,
+            (false, _) => pos,
+        }
+    };
 
-    // Collect open/close tag events keyed by UTF-16 position.
-    // At the same position: closes (is_open=false) sort before opens (is_open=true).
-    struct TagEvent {
-        pos: usize,
-        is_open: bool,
-        tag: String,
+    struct Span {
+        start: usize,
+        end: usize,
+        open: String,
+        close: &'static str,
     }
-    let mut events: Vec<TagEvent> = Vec::new();
-
+    let mut spans: Vec<Span> = Vec::new();
     for entity in entities {
-        match entity {
-            tl::enums::MessageEntity::Bold(e) => {
-                let (o, l) = (e.offset as usize, e.length as usize);
-                events.push(TagEvent {
-                    pos: o,
-                    is_open: true,
-                    tag: "<strong>".into(),
-                });
-                events.push(TagEvent {
-                    pos: o + l,
-                    is_open: false,
-                    tag: "</strong>".into(),
-                });
+        let (offset, length, open, close): (i32, i32, String, &'static str) = match entity {
+            E::Bold(e) => (e.offset, e.length, "<strong>".into(), "</strong>"),
+            E::Italic(e) => (e.offset, e.length, "<em>".into(), "</em>"),
+            E::Code(e) => (e.offset, e.length, "<code>".into(), "</code>"),
+            E::Pre(e) => (e.offset, e.length, "<pre><code>".into(), "</code></pre>"),
+            E::Strike(e) => (e.offset, e.length, "<del>".into(), "</del>"),
+            E::Underline(e) => (e.offset, e.length, "<u>".into(), "</u>"),
+            E::Spoiler(e) => (
+                e.offset,
+                e.length,
+                r#"<span data-mx-spoiler="">"#.into(),
+                "</span>",
+            ),
+            E::Blockquote(e) => (e.offset, e.length, "<blockquote>".into(), "</blockquote>"),
+            E::TextUrl(e) => (
+                e.offset,
+                e.length,
+                format!("<a href=\"{}\">", html_escape(&e.url)),
+                "</a>",
+            ),
+            E::Url(e) => {
+                let start = clamp(i64::from(e.offset), true);
+                let end = clamp(i64::from(e.offset) + i64::from(e.length), false);
+                let url = link_target(&String::from_utf16_lossy(&utf16[start..end.max(start)]));
+                (
+                    e.offset,
+                    e.length,
+                    format!("<a href=\"{}\">", html_escape(&url)),
+                    "</a>",
+                )
             }
-            tl::enums::MessageEntity::Italic(e) => {
-                let (o, l) = (e.offset as usize, e.length as usize);
-                events.push(TagEvent {
-                    pos: o,
-                    is_open: true,
-                    tag: "<em>".into(),
-                });
-                events.push(TagEvent {
-                    pos: o + l,
-                    is_open: false,
-                    tag: "</em>".into(),
-                });
-            }
-            tl::enums::MessageEntity::Code(e) => {
-                let (o, l) = (e.offset as usize, e.length as usize);
-                events.push(TagEvent {
-                    pos: o,
-                    is_open: true,
-                    tag: "<code>".into(),
-                });
-                events.push(TagEvent {
-                    pos: o + l,
-                    is_open: false,
-                    tag: "</code>".into(),
-                });
-            }
-            tl::enums::MessageEntity::Pre(e) => {
-                let (o, l) = (e.offset as usize, e.length as usize);
-                events.push(TagEvent {
-                    pos: o,
-                    is_open: true,
-                    tag: "<pre><code>".into(),
-                });
-                events.push(TagEvent {
-                    pos: o + l,
-                    is_open: false,
-                    tag: "</code></pre>".into(),
-                });
-            }
-            tl::enums::MessageEntity::Strike(e) => {
-                let (o, l) = (e.offset as usize, e.length as usize);
-                events.push(TagEvent {
-                    pos: o,
-                    is_open: true,
-                    tag: "<del>".into(),
-                });
-                events.push(TagEvent {
-                    pos: o + l,
-                    is_open: false,
-                    tag: "</del>".into(),
-                });
-            }
-            tl::enums::MessageEntity::Underline(e) => {
-                let (o, l) = (e.offset as usize, e.length as usize);
-                events.push(TagEvent {
-                    pos: o,
-                    is_open: true,
-                    tag: "<u>".into(),
-                });
-                events.push(TagEvent {
-                    pos: o + l,
-                    is_open: false,
-                    tag: "</u>".into(),
-                });
-            }
-            tl::enums::MessageEntity::Spoiler(e) => {
-                let (o, l) = (e.offset as usize, e.length as usize);
-                events.push(TagEvent {
-                    pos: o,
-                    is_open: true,
-                    tag: r#"<span data-mx-spoiler="">"#.into(),
-                });
-                events.push(TagEvent {
-                    pos: o + l,
-                    is_open: false,
-                    tag: "</span>".into(),
-                });
-            }
-            tl::enums::MessageEntity::TextUrl(e) => {
-                let (o, l) = (e.offset as usize, e.length as usize);
-                events.push(TagEvent {
-                    pos: o,
-                    is_open: true,
-                    tag: format!("<a href=\"{}\">", html_escape(&e.url)),
-                });
-                events.push(TagEvent {
-                    pos: o + l,
-                    is_open: false,
-                    tag: "</a>".into(),
-                });
-            }
-            tl::enums::MessageEntity::Url(e) => {
-                let (o, l) = (e.offset as usize, e.length as usize);
-                let end = (o + l).min(utf16.len());
-                let url = String::from_utf16_lossy(&utf16[o..end]).to_string();
-                events.push(TagEvent {
-                    pos: o,
-                    is_open: true,
-                    tag: format!("<a href=\"{}\">", html_escape(&url)),
-                });
-                events.push(TagEvent {
-                    pos: o + l,
-                    is_open: false,
-                    tag: "</a>".into(),
-                });
-            }
-            _ => {}
+            _ => continue,
+        };
+        let start = clamp(i64::from(offset), true);
+        let end = clamp(i64::from(offset) + i64::from(length), false);
+        if end > start {
+            spans.push(Span {
+                start,
+                end,
+                open,
+                close,
+            });
         }
     }
 
-    // Closes (false=0) sort before opens (true=1) at the same position.
-    events.sort_by_key(|e| (e.pos, e.is_open as usize));
+    // Tag events by position. At one position closes come before opens; nested spans close
+    // inner first (the one opened later) and open outer first (the longer one).
+    let mut events: Vec<(usize, u8, Reverse<usize>, i64, &str)> = Vec::new();
+    for (idx, span) in spans.iter().enumerate() {
+        events.push((span.start, 1, Reverse(span.end), idx as i64, &span.open));
+        events.push((span.end, 0, Reverse(span.start), -(idx as i64), span.close));
+    }
+    events.sort_by_key(|&(pos, kind, order, idx, _)| (pos, kind, order, idx));
 
     let mut result = String::new();
-    let mut ev_idx = 0;
-    let mut i = 0usize;
-
-    while i <= utf16.len() {
-        while ev_idx < events.len() && events[ev_idx].pos == i {
-            result.push_str(&events[ev_idx].tag);
-            ev_idx += 1;
+    let mut pos = 0;
+    for (at, _, _, _, tag) in events {
+        if at > pos {
+            push_text(&mut result, &String::from_utf16_lossy(&utf16[pos..at]));
+            pos = at;
         }
-        if i >= utf16.len() {
-            break;
-        }
-        let unit = utf16[i];
-        if (0xD800..=0xDBFF).contains(&unit) && i + 1 < utf16.len() {
-            // Surrogate pair
-            let low = utf16[i + 1];
-            let cp = 0x10000u32 + ((unit as u32 - 0xD800) << 10) + (low as u32 - 0xDC00);
-            if let Some(c) = char::from_u32(cp) {
-                let esc = html_escape_char(c);
-                if esc.is_empty() {
-                    result.push(c);
-                } else {
-                    result.push_str(esc);
-                }
-            }
-            i += 2;
-        } else {
-            if let Some(c) = char::from_u32(unit as u32) {
-                if c == '\n' {
-                    result.push_str("<br>");
-                } else {
-                    let esc = html_escape_char(c);
-                    if esc.is_empty() {
-                        result.push(c);
-                    } else {
-                        result.push_str(esc);
-                    }
-                }
-            }
-            i += 1;
-        }
+        result.push_str(tag);
     }
-
+    push_text(&mut result, &String::from_utf16_lossy(&utf16[pos..]));
     result
 }
 
@@ -294,7 +196,11 @@ fn format_message(
     let plain = text.to_owned();
     let html = match entities {
         Some(ents) if !ents.is_empty() => entities_to_html(text, ents),
-        _ => html_escape(text).replace('\n', "<br>"),
+        _ => {
+            let mut html = String::new();
+            push_text(&mut html, text);
+            html
+        }
     };
     Some((plain, html))
 }
@@ -319,30 +225,6 @@ fn is_terminal_telegram_error(err: &InvocationError) -> bool {
         ),
         _ => false,
     }
-}
-
-/// How often the heartbeat file's timestamp is refreshed. Must stay well
-/// under the `HEALTHCHECK` staleness threshold in the Dockerfile.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Periodically touches a file so an external health check can tell "the
-/// process is alive but the runtime is wedged" apart from "still running
-/// normally". Errors are logged once but never fatal. A broken heartbeat
-/// file should not take the bot down.
-async fn heartbeat_loop(path: PathBuf) {
-    loop {
-        if let Err(e) = fs::write(&path, unix_now_secs().to_string()).await {
-            warn!("Failed to write heartbeat file {path:?}: {e}");
-        }
-        sleep(HEARTBEAT_INTERVAL).await;
-    }
-}
-
-fn unix_now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// (Re)builds a Telegram connection: a fresh [`SenderPool`], its client
@@ -372,16 +254,43 @@ fn spawn_sender_pool(
 
 // ── Last-ID persistence ───────────────────────────────────────────────────────
 
+/// The last mirrored message ID; 0 when nothing was mirrored yet (no file). A file that
+/// cannot be read or parsed is reported, since 0 means "first run" (history_limit backfill).
 async fn read_last_id(path: &std::path::Path) -> i32 {
-    fs::read_to_string(path)
-        .await
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
+    match fs::read_to_string(path).await {
+        Ok(text) => parse_last_id(&text).unwrap_or_else(|| {
+            warn!(?path, content = %text.trim(), "Unreadable last_message_id: treating as first run");
+            0
+        }),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+        Err(e) => {
+            warn!(?path, "Failed to read last_message_id: {e}: treating as first run");
+            0
+        }
+    }
 }
 
+/// Channel message IDs only grow: one at or below the last mirrored ID was sent already.
+fn is_new_message(msg_id: i32, last_forwarded: i32) -> bool {
+    msg_id > last_forwarded
+}
+
+fn parse_last_id(text: &str) -> Option<i32> {
+    text.trim().parse().ok().filter(|id| *id >= 0)
+}
+
+/// Persist the last mirrored ID atomically (temporary file plus rename): a crash mid-write
+/// must not leave an empty file, which would read as a first run and repost the history.
 async fn write_last_id(path: &std::path::Path, id: i32) {
-    if let Err(e) = fs::write(path, id.to_string()).await {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let result = async {
+        fs::write(&tmp, id.to_string()).await?;
+        fs::rename(&tmp, path).await
+    }
+    .await;
+    if let Err(e) = result {
         warn!("Failed to persist last_message_id: {e}");
     }
 }
@@ -442,11 +351,6 @@ async fn backfill(
         write_last_id(last_id_path, msg.id()).await;
     }
 
-    // Ensure we save the newest ID even if all messages were media-only
-    if let Some(newest) = batch.last() {
-        write_last_id(last_id_path, newest.id()).await;
-    }
-
     info!("Backfill complete");
     Ok(())
 }
@@ -459,31 +363,69 @@ async fn backfill(
 /// reject uploads well below this anyway.
 const MAX_MEDIA_BYTES: usize = 100 * 1024 * 1024;
 
-async fn send_text_to_rooms(matrix: &Bot, plain: &str, html: &str, tg_msg_id: i32) {
-    let rooms = matrix.broadcast_rooms();
-    if rooms.is_empty() {
-        warn!(
-            tg_msg_id,
-            "telegram->matrix: no joined Matrix rooms, message dropped"
-        );
-        return;
+/// Waits between delivery rounds for the parts of a message that still failed transiently
+/// (each text send has its own short retries first): about eight minutes of homeserver
+/// trouble are bridged before a message is given up. Telegram updates queue meanwhile.
+const DELIVERY_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+    Duration::from_secs(300),
+];
+
+/// A Telegram media item, downloaded once for all rooms.
+struct PreparedMedia {
+    filename: String,
+    mime: mime::Mime,
+    bytes: Vec<u8>,
+    /// Pixel size of an image; 0 = unknown.
+    width: u32,
+    height: u32,
+}
+
+impl PreparedMedia {
+    fn new(filename: String, mime: mime::Mime, bytes: Vec<u8>) -> Self {
+        let (width, height) = if mime.type_() == mime::IMAGE {
+            media_dimensions(&bytes)
+        } else {
+            (0, 0)
+        };
+        Self {
+            filename,
+            mime,
+            bytes,
+            width,
+            height,
+        }
     }
-    for room in rooms {
-        let content = RoomMessageEventContent::text_html(plain, html);
-        if let Err(e) = room.send(content).await {
-            error!(
-                room_id = %room.room_id(),
-                tg_msg_id,
-                direction = "telegram->matrix",
-                op = "send_text",
-                "Failed to send message: {e}"
-            );
+
+    /// The attachment info (not `Clone`, so built per send).
+    fn info(&self) -> AttachmentInfo {
+        let size = UInt::new(self.bytes.len() as u64);
+        let known = |v: u32| (v > 0).then(|| UInt::from(v));
+        match self.mime.type_() {
+            mime::IMAGE => AttachmentInfo::Image(BaseImageInfo {
+                width: known(self.width),
+                height: known(self.height),
+                size,
+                ..Default::default()
+            }),
+            mime::AUDIO => AttachmentInfo::Audio(BaseAudioInfo {
+                size,
+                ..Default::default()
+            }),
+            mime::VIDEO => AttachmentInfo::Video(BaseVideoInfo {
+                size,
+                ..Default::default()
+            }),
+            _ => AttachmentInfo::File(BaseFileInfo { size }),
         }
     }
 }
 
-/// Download a Telegram media item and send it to all joined Matrix rooms.
-async fn send_media_to_rooms(tg: &TgClient, matrix: &Bot, media: &Media, tg_msg_id: i32) {
+/// Download a Telegram media item; `None` for media without a file (polls, contacts, geo,
+/// ...) and when the download fails or is too large (logged).
+async fn download_media(tg: &TgClient, media: &Media, tg_msg_id: i32) -> Option<PreparedMedia> {
     let (mime_str, filename) = match media {
         Media::Photo(_) => ("image/jpeg".to_owned(), "photo.jpg".to_owned()),
         Media::Document(doc) => {
@@ -502,14 +444,17 @@ async fn send_media_to_rooms(tg: &TgClient, matrix: &Bot, media: &Media, tg_msg_
             let m = s.document.mime_type().unwrap_or("image/webp").to_owned();
             (m, "sticker.webp".to_owned())
         }
-        _ => return, // polls, contacts, geo, etc.
+        _ => return None,
     };
 
     let mime: mime::Mime = match mime_str.parse() {
         Ok(m) => m,
         Err(e) => {
-            warn!(tg_msg_id, "Invalid MIME type '{mime_str}': {e}");
-            return;
+            warn!(
+                tg_msg_id,
+                "Invalid MIME type '{mime_str}': {e}, sending as a file"
+            );
+            mime::APPLICATION_OCTET_STREAM
         }
     };
 
@@ -525,84 +470,57 @@ async fn send_media_to_rooms(tg: &TgClient, matrix: &Bot, media: &Media, tg_msg_
                         limit_bytes = MAX_MEDIA_BYTES,
                         "Media exceeds size limit: skipping attachment"
                     );
-                    return;
+                    return None;
                 }
                 bytes.extend_from_slice(&chunk);
             }
             Ok(None) => break,
             Err(e) => {
                 warn!(tg_msg_id, "Failed to download media: {e}");
-                return;
+                return None;
             }
         }
     }
-    if bytes.is_empty() {
-        return;
+    (!bytes.is_empty()).then(|| PreparedMedia::new(filename, mime, bytes))
+}
+
+/// One Telegram message, ready to send: media (above, as in Telegram) and text / caption.
+struct Outgoing {
+    media: Option<PreparedMedia>,
+    text: Option<RoomMessageEventContent>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Part {
+    Media,
+    Text,
+}
+
+impl Outgoing {
+    fn parts(&self) -> Vec<Part> {
+        let mut parts = Vec::new();
+        if self.media.is_some() {
+            parts.push(Part::Media);
+        }
+        if self.text.is_some() {
+            parts.push(Part::Text);
+        }
+        parts
     }
 
-    // Extract metadata once before the per-room loop.
-    let size = bytes.len();
-    let is_image = mime.type_() == mime::IMAGE;
-    let is_audio = mime.type_() == mime::AUDIO;
-    let is_video = mime.type_() == mime::VIDEO;
-    let (img_w, img_h) = if is_image {
-        media_dimensions(&bytes)
-    } else {
-        (0, 0)
-    };
-
-    let rooms = matrix.broadcast_rooms();
-    if rooms.is_empty() {
-        warn!("No joined Matrix rooms: media dropped");
-        return;
-    }
-    for room in rooms {
-        // Rebuild AttachmentInfo per iteration (not Clone) from the primitives above.
-        let uint_size = UInt::new(size as u64);
-        let info = if is_image {
-            AttachmentInfo::Image(BaseImageInfo {
-                width: if img_w > 0 {
-                    UInt::new(img_w as u64)
-                } else {
-                    None
-                },
-                height: if img_h > 0 {
-                    UInt::new(img_h as u64)
-                } else {
-                    None
-                },
-                size: uint_size,
-                ..Default::default()
-            })
-        } else if is_audio {
-            AttachmentInfo::Audio(BaseAudioInfo {
-                size: uint_size,
-                ..Default::default()
-            })
-        } else if is_video {
-            AttachmentInfo::Video(BaseVideoInfo {
-                size: uint_size,
-                ..Default::default()
-            })
-        } else {
-            AttachmentInfo::File(BaseFileInfo { size: uint_size })
-        };
-        if let Err(e) = room
-            .send_attachment(
-                &filename,
-                &mime,
-                bytes.clone(),
-                AttachmentConfig::new().info(info),
-            )
-            .await
-        {
-            error!(
-                room_id = %room.room_id(),
-                tg_msg_id,
-                direction = "telegram->matrix",
-                op = "send_media",
-                "Failed to send media: {e}"
-            );
+    async fn send(&self, room: &Room, part: Part) -> Result<(), MatrixError> {
+        match (part, &self.media, &self.text) {
+            (Part::Media, Some(media), _) => room
+                .send_attachment(
+                    &media.filename,
+                    &media.mime,
+                    media.bytes.clone(),
+                    AttachmentConfig::new().info(media.info()),
+                )
+                .await
+                .map(|_| ()),
+            (Part::Text, _, Some(text)) => send_with_retry(room, text.clone()).await.map(|_| ()),
+            _ => Ok(()),
         }
     }
 }
@@ -619,19 +537,71 @@ fn media_dimensions(data: &[u8]) -> (u32, u32) {
         .unwrap_or((0, 0))
 }
 
-/// Forward one Telegram message (text and/or media) to all Matrix rooms.
+/// Forward one Telegram message (text and/or media) to all broadcast rooms. Parts that
+/// failed transiently are sent again in later rounds ([`DELIVERY_RETRY_DELAYS`]), so a
+/// homeserver restart loses nothing; a part retried late may arrive below a newer one.
 async fn forward_message(tg: &TgClient, matrix: &Bot, msg: &TgMessage) {
     let msg_id = msg.id();
-    // Send media first (mirrors Telegram's layout: image above caption)
-    if let Some(media) = msg.media() {
-        send_media_to_rooms(tg, matrix, &media, msg_id).await;
+    let media = match msg.media() {
+        Some(media) => download_media(tg, &media, msg_id).await,
+        None => None,
+    };
+    let text = format_message(msg.text(), msg.fmt_entities())
+        .map(|(plain, html)| RoomMessageEventContent::text_html(plain, html));
+    let outgoing = Outgoing { media, text };
+    let parts = outgoing.parts();
+    if parts.is_empty() {
+        return;
     }
-    // Send text / caption
-    let text = msg.text();
-    if !text.is_empty() {
-        if let Some((plain, html)) = format_message(text, msg.fmt_entities()) {
-            send_text_to_rooms(matrix, &plain, &html, msg_id).await;
+    let rooms = matrix.broadcast_rooms();
+    if rooms.is_empty() {
+        warn!(
+            tg_msg_id = msg_id,
+            "telegram->matrix: no joined Matrix rooms, message dropped"
+        );
+        return;
+    }
+    let mut pending: Vec<(Room, Part)> = rooms
+        .iter()
+        .flat_map(|room| parts.iter().map(move |part| (room.clone(), *part)))
+        .collect();
+    let mut delays = DELIVERY_RETRY_DELAYS.iter();
+    loop {
+        let mut failed = Vec::new();
+        for (room, part) in pending {
+            if let Err(e) = outgoing.send(&room, part).await {
+                let (retryable, _) = classify_error(&e);
+                error!(
+                    room_id = %room.room_id(),
+                    tg_msg_id = msg_id,
+                    direction = "telegram->matrix",
+                    ?part,
+                    retryable,
+                    "Failed to send: {e}"
+                );
+                if retryable {
+                    failed.push((room, part));
+                }
+            }
         }
+        if failed.is_empty() {
+            return;
+        }
+        let Some(delay) = delays.next() else {
+            error!(
+                tg_msg_id = msg_id,
+                failed = failed.len(),
+                "telegram->matrix: giving up, message parts lost in some rooms"
+            );
+            return;
+        };
+        warn!(
+            tg_msg_id = msg_id,
+            failed = failed.len(),
+            "telegram->matrix: sending the failed parts again in {delay:?}"
+        );
+        sleep(*delay).await;
+        pending = failed;
     }
 }
 
@@ -647,11 +617,9 @@ async fn main() -> Result<()> {
     let store_path = mxbot_common::config::store_path_from_env();
     fs::create_dir_all(&store_path).await?;
 
-    // A liveness heartbeat for `docker healthcheck`: touched on a fixed timer by a task
-    // independent of Matrix/Telegram traffic, so it keeps ticking through quiet periods but
-    // stalls if the async runtime itself wedges (e.g. a deadlock). The one failure mode that
-    // "the process is still running" can't detect on its own.
-    tokio::spawn(heartbeat_loop(store_path.join(".heartbeat")));
+    // Liveness: mxbot-common's heartbeat file (MXBOT_HEARTBEAT_FILE), refreshed by every
+    // successful Matrix sync (sync_forever_with below), so a dead sync or a wedged runtime
+    // both make the health check fail.
 
     // ── Telegram client ───────────────────────────────────────────────────────
 
@@ -844,6 +812,7 @@ async fn run_telegram_bridge(
                 continue 'reconnect;
             }
         };
+        let mut last_forwarded = read_last_id(&last_id_path).await;
         info!(chat = %channel, "Listening for Telegram updates");
         backoff.reset();
 
@@ -854,6 +823,11 @@ async fn run_telegram_bridge(
                         continue;
                     }
                     let msg_id = msg.id();
+                    // Updates queued while the backfill ran may repeat what it sent.
+                    if !is_new_message(msg_id, last_forwarded) {
+                        info!(chat = %channel, tg_msg_id = msg_id, "Already mirrored, skipped");
+                        continue;
+                    }
                     info!(
                         chat = %channel,
                         tg_msg_id = msg_id,
@@ -862,6 +836,7 @@ async fn run_telegram_bridge(
                     );
                     forward_message(&tg, &matrix, &msg).await;
                     write_last_id(&last_id_path, msg_id).await;
+                    last_forwarded = msg_id;
                     backoff.reset();
                 }
                 Ok(_) => {}
@@ -959,8 +934,129 @@ mod tests {
 
     #[test]
     fn entities_to_html_escapes_plain_text() {
-        let html = entities_to_html("<script>&\"", &[]);
-        assert_eq!(html, "&lt;script&gt;&amp;&quot;");
+        let html = entities_to_html("<script>&\"\n", &[]);
+        assert_eq!(html, "&lt;script&gt;&amp;&quot;<br>");
+    }
+
+    fn bold(offset: i32, length: i32) -> tl::enums::MessageEntity {
+        tl::enums::MessageEntity::Bold(tl::types::MessageEntityBold { offset, length })
+    }
+
+    fn italic(offset: i32, length: i32) -> tl::enums::MessageEntity {
+        tl::enums::MessageEntity::Italic(tl::types::MessageEntityItalic { offset, length })
+    }
+
+    fn url(offset: i32, length: i32) -> tl::enums::MessageEntity {
+        tl::enums::MessageEntity::Url(tl::types::MessageEntityUrl { offset, length })
+    }
+
+    #[test]
+    fn entities_outside_the_text_do_not_panic_and_tags_stay_closed() {
+        // Offsets from the network: beyond the end, negative, overflowing.
+        let html = entities_to_html(
+            "hi",
+            &[
+                url(5, 3),
+                bold(-3, 4),
+                italic(1, i32::MAX),
+                url(i32::MAX, i32::MAX),
+            ],
+        );
+        assert_eq!(html, "<strong>h</strong><em>i</em>");
+        assert_eq!(html.matches("<a ").count(), 0, "empty links are dropped");
+    }
+
+    #[test]
+    fn entity_boundaries_inside_a_surrogate_pair_keep_the_character_whole() {
+        // "a😀b": the emoji is UTF-16 units 1..3; an entity cut at unit 2 widens to it.
+        let html = entities_to_html("a\u{1F600}b", &[bold(2, 1), italic(0, 2)]);
+        assert_eq!(html, "<em>a<strong>\u{1F600}</strong></em>b");
+        assert!(!html.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn nested_entities_close_inner_first() {
+        // Bold over all, italic over the end: both end at the same position.
+        let html = entities_to_html("abcd", &[bold(0, 4), italic(2, 2)]);
+        assert_eq!(html, "<strong>ab<em>cd</em></strong>");
+        // Same start, the longer one opens first.
+        let html = entities_to_html("abcd", &[italic(0, 2), bold(0, 4)]);
+        assert_eq!(html, "<strong><em>ab</em>cd</strong>");
+    }
+
+    #[test]
+    fn urls_and_text_are_escaped_for_attributes() {
+        let text = "x\"><script>";
+        let html = entities_to_html(text, &[url(0, text.encode_utf16().count() as i32)]);
+        assert_eq!(
+            html,
+            "<a href=\"https://x&quot;&gt;&lt;script&gt;\">x&quot;&gt;&lt;script&gt;</a>"
+        );
+        let (_, html) = format_message("it's <b>\nnext", None).unwrap();
+        assert_eq!(html, "it&#39;s &lt;b&gt;<br>next");
+    }
+
+    #[test]
+    fn bare_urls_link_absolutely() {
+        let html = entities_to_html("see example.com/a", &[url(4, 13)]);
+        assert_eq!(
+            html,
+            "see <a href=\"https://example.com/a\">example.com/a</a>"
+        );
+        assert_eq!(link_target("http://x.y"), "http://x.y");
+    }
+
+    #[test]
+    fn last_id_parsing_rejects_garbage() {
+        assert_eq!(parse_last_id("42\n"), Some(42));
+        assert_eq!(parse_last_id(""), None);
+        assert_eq!(parse_last_id("-1"), None);
+        assert_eq!(parse_last_id("4x"), None);
+    }
+
+    #[tokio::test]
+    async fn last_id_is_written_atomically_and_read_back() {
+        let dir = std::env::temp_dir().join(format!("tg-mirror-last-id-{}", std::process::id()));
+        fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("last_message_id");
+        assert_eq!(read_last_id(&path).await, 0);
+        write_last_id(&path, 7).await;
+        write_last_id(&path, 12).await;
+        assert_eq!(read_last_id(&path).await, 12);
+        assert!(!dir.join("last_message_id.tmp").exists());
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[test]
+    fn already_mirrored_messages_are_not_new() {
+        assert!(is_new_message(11, 10));
+        assert!(!is_new_message(10, 10));
+        assert!(!is_new_message(3, 10));
+        assert!(is_new_message(1, 0));
+    }
+
+    #[test]
+    fn media_info_matches_the_mime_type() {
+        let png = PreparedMedia::new("a.png".into(), mime::IMAGE_PNG, vec![1, 2, 3]);
+        match png.info() {
+            AttachmentInfo::Image(info) => {
+                assert_eq!(info.size, UInt::new(3));
+                assert_eq!(info.width, None, "undecodable image: size unknown");
+            }
+            _ => panic!("expected image info"),
+        }
+        let pdf = PreparedMedia::new("a.pdf".into(), mime::APPLICATION_PDF, vec![0; 10]);
+        assert!(matches!(pdf.info(), AttachmentInfo::File(_)));
+    }
+
+    #[test]
+    fn rendered_house_infra_config_parses() {
+        // A copy of house-infra's rendered config (fake secrets), as deployed.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/house-infra-config.toml");
+        let config: Config = mxbot_common::config::load_toml(std::path::Path::new(path))
+            .expect("the config house-infra renders");
+        config.security.validate().unwrap();
+        assert_eq!(config.telegram.history_limit, 50);
     }
 
     #[test]
