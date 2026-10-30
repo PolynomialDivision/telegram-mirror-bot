@@ -71,8 +71,10 @@ WORKDIR /app
 
 # mxbot-common's heartbeat: the bot writes the Unix time into this file after every
 # successful Matrix sync (long polling returns at least every 30 s), so a stale file means the
-# sync is dead or the runtime is wedged. Set here so the image is healthy on its own; house-infra
-# with `heartbeat: true` sets the same variable and the same check in compose.
+# sync is dead or the runtime is wedged. The Telegram side withholds it too while it has not
+# listened for updates for 30 minutes (stuck reconnecting or hanging). Set here so the image is
+# healthy on its own; house-infra with `heartbeat: true` sets the same variable and the same
+# check in compose.
 ENV MXBOT_HEARTBEAT_FILE=/app/store/.heartbeat
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
     CMD sh -c 'f="$MXBOT_HEARTBEAT_FILE"; [ -f "$f" ] && [ $(( $(date +%s) - $(cat "$f") )) -lt 120 ]'

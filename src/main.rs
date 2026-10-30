@@ -32,6 +32,7 @@ use mxbot_common::{
     },
     retry::Backoff,
     send::{classify_error, send_with_retry},
+    supervise::{supervise_ticking, Alive},
     Bot,
 };
 use serde::Deserialize;
@@ -229,10 +230,10 @@ fn is_terminal_telegram_error(err: &InvocationError) -> bool {
 
 /// (Re)builds a Telegram connection: a fresh [`SenderPool`], its client
 /// handle, and the raw update receiver. The pool's driver task is spawned
-/// and supervised here. If it ever exits (e.g. because of a panic deep in
-/// the transport layer), that is logged instead of silently vanishing, and
-/// the closed `updates` channel is what lets [`InvocationError::Dropped`]
-/// surface to callers so they know to reconnect.
+/// and supervised here. If it ever exits, that is logged instead of silently
+/// vanishing, and the closed `updates` channel is what lets
+/// [`InvocationError::Dropped`] surface to callers so they know to reconnect.
+/// A panic in the transport layer ends the bot (panic = "abort", Cargo.toml).
 fn spawn_sender_pool(
     session: &Arc<SqliteSession>,
     api_id: i32,
@@ -372,6 +373,14 @@ const DELIVERY_RETRY_DELAYS: [Duration; 4] = [
     Duration::from_secs(120),
     Duration::from_secs(300),
 ];
+
+/// The Telegram side must be listening (or forwarding) at least once in this time, else
+/// the heartbeat stops. Generous: a reconnect backs off up to two minutes, one message's
+/// delivery rounds take about eight, and a backfill or a FLOOD_WAIT can take a while.
+const TELEGRAM_ALIVE_WITHIN: Duration = Duration::from_secs(30 * 60);
+
+/// How often the Telegram side ticks while it waits for the next update.
+const TELEGRAM_TICK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A Telegram media item, downloaded once for all rooms.
 struct PreparedMedia {
@@ -619,7 +628,8 @@ async fn main() -> Result<()> {
 
     // Liveness: mxbot-common's heartbeat file (MXBOT_HEARTBEAT_FILE), refreshed by every
     // successful Matrix sync (sync_forever_with below), so a dead sync or a wedged runtime
-    // both make the health check fail.
+    // both make the health check fail. The Telegram side ticks while it listens, so one stuck
+    // reconnecting or hanging stops the heartbeat too (supervise_ticking below).
 
     // ── Telegram client ───────────────────────────────────────────────────────
 
@@ -688,17 +698,17 @@ async fn main() -> Result<()> {
     //
     // Both sides are supervised: a transient failure on either one is retried
     // with backoff in place, and neither side's failure takes the other down.
-    // The whole process only exits on a genuinely unrecoverable error, or on
-    // SIGTERM/SIGINT for a clean shutdown.
+    // The whole process only exits on a genuinely unrecoverable error (the
+    // Telegram side's end exits through supervise_ticking), or on SIGTERM/SIGINT
+    // for a clean shutdown.
 
     let matrix_sync_handle = tokio::spawn({
         let matrix = matrix.clone();
         async move { mxbot_common::sync::sync_forever_with(&matrix.client, || {}).await }
     });
 
-    tokio::select! {
-        () = mxbot_common::sync::shutdown_signal() => Ok(()),
-        res = run_telegram_bridge(
+    supervise_ticking("telegram updates", TELEGRAM_ALIVE_WITHIN, |alive| {
+        run_telegram_bridge(
             session,
             config.telegram.api_id,
             config.telegram.channel.clone(),
@@ -707,9 +717,12 @@ async fn main() -> Result<()> {
             updates,
             matrix,
             last_id_path,
-        ) => {
-            res.context("Telegram bridge task ended")
-        }
+            alive,
+        )
+    });
+
+    tokio::select! {
+        () = mxbot_common::sync::shutdown_signal() => Ok(()),
         res = matrix_sync_handle => {
             match res {
                 Ok(()) => Err(anyhow::anyhow!("Matrix sync task exited unexpectedly")),
@@ -725,7 +738,8 @@ async fn main() -> Result<()> {
 /// connection is irrecoverably lost (`InvocationError::Dropped`), honors
 /// Telegram's `FLOOD_WAIT` retry_after, and backs off with jitter for other
 /// transient errors. Only returns on a genuinely permanent failure (unknown
-/// channel, revoked/banned session).
+/// channel, revoked/banned session). Ticks `alive` while it waits for updates
+/// and after each forwarded message, never while reconnecting.
 #[allow(clippy::too_many_arguments)]
 async fn run_telegram_bridge(
     session: Arc<SqliteSession>,
@@ -736,6 +750,7 @@ async fn run_telegram_bridge(
     mut updates: mpsc::UnboundedReceiver<UpdatesLike>,
     matrix: Bot,
     last_id_path: PathBuf,
+    alive: Alive,
 ) -> Result<()> {
     let mut backoff = Backoff::new(Duration::from_secs(2), Duration::from_secs(120)).with_jitter();
 
@@ -815,9 +830,19 @@ async fn run_telegram_bridge(
         let mut last_forwarded = read_last_id(&last_id_path).await;
         info!(chat = %channel, "Listening for Telegram updates");
         backoff.reset();
+        let mut ticks = tokio::time::interval(TELEGRAM_TICK_INTERVAL);
 
         loop {
-            match update_stream.next().await {
+            // Tick while waiting; the same `next` future is polled throughout, never dropped.
+            let next = update_stream.next();
+            tokio::pin!(next);
+            let update = loop {
+                tokio::select! {
+                    update = &mut next => break update,
+                    _ = ticks.tick() => alive.tick(),
+                }
+            };
+            match update {
                 Ok(Update::NewMessage(msg)) => {
                     if msg.outgoing() || msg.peer_id() != channel_peer_id {
                         continue;
@@ -838,6 +863,7 @@ async fn run_telegram_bridge(
                     write_last_id(&last_id_path, msg_id).await;
                     last_forwarded = msg_id;
                     backoff.reset();
+                    alive.tick();
                 }
                 Ok(_) => {}
                 Err(InvocationError::Dropped) => {
