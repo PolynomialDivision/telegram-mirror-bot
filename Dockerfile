@@ -53,7 +53,7 @@ RUN --mount=type=cache,id=shared-cargo-git,target=/usr/local/cargo/git,sharing=p
     --mount=type=cache,id=shared-cargo-registry,target=/usr/local/cargo/registry,sharing=private \
     --mount=type=cache,id=shared-sccache,target=/sccache \
     --mount=type=cache,id=telegram-mirror-bot-target,target=/build/target \
-    cargo build --release && \
+    cargo build --release --locked && \
     cp target/release/telegram-mirror-bot /telegram-mirror-bot
 
 # ── Runtime ───────────────────────────────────────────────────────────────────
