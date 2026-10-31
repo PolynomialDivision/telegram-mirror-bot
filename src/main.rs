@@ -753,6 +753,10 @@ async fn run_telegram_bridge(
     alive: Alive,
 ) -> Result<()> {
     let mut backoff = Backoff::new(Duration::from_secs(2), Duration::from_secs(120)).with_jitter();
+    // For the status file: while listening, a round (idle or a forwarded message) every tick
+    // interval; reconnects and stream errors are failed rounds (they tick once each, and a
+    // run of them longer than TELEGRAM_ALIVE_WITHIN is unhealthy as before).
+    alive.expect_every(TELEGRAM_TICK_INTERVAL);
 
     'reconnect: loop {
         let channel_peer = loop {
@@ -765,6 +769,7 @@ async fn run_telegram_bridge(
                 Err(InvocationError::Dropped) => {
                     let delay = backoff.next_delay();
                     warn!(chat = %channel, ?delay, "Telegram connection pool is gone while resolving channel: reconnecting");
+                    alive.failed("Telegram connection lost while resolving the channel");
                     sleep(delay).await;
                     let (new_tg, new_updates) = spawn_sender_pool(&session, api_id);
                     tg = new_tg;
@@ -777,6 +782,7 @@ async fn run_telegram_bridge(
                 Err(e) => {
                     let delay = backoff.next_delay();
                     warn!(chat = %channel, "Failed to resolve Telegram channel: {e} (transient), retrying in {delay:?}");
+                    alive.failed(format!("resolving the Telegram channel failed: {e}"));
                     sleep(delay).await;
                 }
             }
@@ -803,6 +809,7 @@ async fn run_telegram_bridge(
         .await
         {
             warn!(chat = %channel, "Backfill failed: {e}, continuing with live updates only");
+            alive.failed(format!("backfill failed: {e}"));
         }
 
         let mut update_stream = match tg
@@ -820,6 +827,7 @@ async fn run_telegram_bridge(
                 // The receiver is spent, so start over with a fresh pool.
                 let delay = backoff.next_delay();
                 warn!(chat = %channel, "Could not start the Telegram update stream: {e}, retrying in {delay:?}");
+                alive.failed(format!("starting the Telegram update stream failed: {e}"));
                 sleep(delay).await;
                 let (new_tg, new_updates) = spawn_sender_pool(&session, api_id);
                 tg = new_tg;
@@ -839,7 +847,8 @@ async fn run_telegram_bridge(
             let update = loop {
                 tokio::select! {
                     update = &mut next => break update,
-                    _ = ticks.tick() => alive.tick(),
+                    // Listening with nothing new: a healthy round.
+                    _ = ticks.tick() => alive.idle(),
                 }
             };
             match update {
@@ -863,12 +872,13 @@ async fn run_telegram_bridge(
                     write_last_id(&last_id_path, msg_id).await;
                     last_forwarded = msg_id;
                     backoff.reset();
-                    alive.tick();
+                    alive.ok();
                 }
                 Ok(_) => {}
                 Err(InvocationError::Dropped) => {
                     let delay = backoff.next_delay();
                     warn!(chat = %channel, ?delay, "Telegram connection pool is gone: reconnecting");
+                    alive.failed("Telegram connection lost");
                     sleep(delay).await;
                     let (new_tg, new_updates) = spawn_sender_pool(&session, api_id);
                     tg = new_tg;
@@ -882,6 +892,7 @@ async fn run_telegram_bridge(
                         retry_after_s = wait,
                         "Telegram rate limit (FLOOD_WAIT): honoring retry_after"
                     );
+                    alive.failed(format!("Telegram rate limit, waiting {wait} s"));
                     sleep(Duration::from_secs(wait as u64)).await;
                 }
                 Err(e) if is_terminal_telegram_error(&e) => {
@@ -891,6 +902,7 @@ async fn run_telegram_bridge(
                 Err(e) => {
                     let delay = backoff.next_delay();
                     warn!(chat = %channel, "Telegram update stream error (transient): {e}, retrying in {delay:?}");
+                    alive.failed(format!("Telegram update stream error: {e}"));
                     sleep(delay).await;
                 }
             }
